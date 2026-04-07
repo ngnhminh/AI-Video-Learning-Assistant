@@ -1,26 +1,30 @@
 from __future__ import annotations
 
-import json
+from dotenv import load_dotenv
+
 import os
 import re
-import smtplib
+import json
 import time
 import tempfile
-
-from pydantic import BaseModel
-from typing import Literal
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 from dataclasses import dataclass, field
-from datetime import datetime
-from email.message import EmailMessage
-from pathlib import Path
-from typing import Any, Optional
+from typing import Optional, Any
 
 from google import genai
 from google.genai import types
 
-from schemas import LearningOutput
+from schemas import LearningOutput, TopicSearchResult
 
+load_dotenv()
+
+
+# =========================
+# STATE
+# =========================
 
 @dataclass
 class AgentState:
@@ -30,728 +34,529 @@ class AgentState:
     video_name: Optional[str] = None
     uploaded_file_name: str = ""
     uploaded_file_uri: str = ""
-    save_requested: bool = False
-    export_requested: bool = False
-    export_format: str = "md"
-    send_email_requested: bool = False
-    email_to: str = ""
-    filename_hint: str = ""
     logs: list[str] = field(default_factory=list)
 
 
-class AgentLoopResponse(BaseModel):
-    thought: str
-    action: Literal["tool", "final"]
-    tool_name: Optional[str] = None
-    tool_args: Optional[dict[str, Any]] = None
-    final_answer: Optional[LearningOutput] = None
+# =========================
+# AGENT
+# =========================
 
-
-class VideoLearningAgent:
-    def __init__(self, api_key: str, model: str) -> None:
+class GeminiVideoAgent:
+    def __init__(self, api_key: str, model: str):
         self.client = genai.Client(api_key=api_key)
         self.model = model
         self.state = AgentState()
-        self.output_dir = Path("outputs")
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.inline_video_limit = 20 * 1024 * 1024   # 20 MB
-        self.file_api_limit = 2 * 1024 * 1024 * 1024 # 2 GB
-        self.file_active_timeout_seconds = 300
-        self.file_poll_interval_seconds = 5
 
-    def reset_state(
-        self,
-        transcript: Optional[str] = None,
-        video_bytes: Optional[bytes] = None,
-        video_mime: Optional[str] = None,
-        video_name: Optional[str] = None,
-    ) -> None:
-        self.state = AgentState(
-            transcript=transcript,
-            video_bytes=video_bytes,
-            video_mime=video_mime,
-            video_name=video_name,
-            uploaded_file_name="",
-            uploaded_file_uri="",
-        )
+        self.inline_limit = 20 * 1024 * 1024
+        self.file_limit = 2 * 1024 * 1024 * 1024
 
     # =========================
-    # Internal file helpers
+    # FILE HANDLING
     # =========================
-    def _get_file_state_name(self, uploaded_file: Any) -> Optional[str]:
-        state = getattr(uploaded_file, "state", None)
-        if state is None:
-            return None
-        return getattr(state, "name", None) or str(state)
 
-    def _wait_until_file_active(self, file_name: str) -> dict[str, Any]:
-        waited = 0
+    def _wait_active(self, name: str):
+        while True:
+            f = self.client.files.get(name=name)
+            state = getattr(f.state, "name", None)
 
-        while waited <= self.file_active_timeout_seconds:
-            uploaded = self.client.files.get(name=file_name)
-            state_name = self._get_file_state_name(uploaded)
-            self.state.logs.append(f"Polling file state: {file_name} -> {state_name}")
+            if state == "ACTIVE":
+                return f
 
-            if state_name == "ACTIVE":
-                self.state.uploaded_file_name = uploaded.name or ""
-                self.state.uploaded_file_uri = getattr(uploaded, "uri", "") or ""
-                return {
-                    "status": "success",
-                    "file": uploaded,
-                    "state": state_name,
-                }
+            if state == "FAILED":
+                raise RuntimeError("File processing FAILED")
 
-            if state_name == "FAILED":
-                return {
-                    "status": "error",
-                    "message": "File upload đã thất bại trong quá trình xử lý của Gemini (state=FAILED).",
-                }
+            time.sleep(5)
 
-            time.sleep(self.file_poll_interval_seconds)
-            waited += self.file_poll_interval_seconds
-
-        return {
-            "status": "error",
-            "message": f"Hết thời gian chờ file chuyển sang ACTIVE sau {self.file_active_timeout_seconds} giây.",
-        }
-
-    # =========================
-    # Tools exposed to Gemini
-    # =========================
-    def ingest_video(self) -> dict[str, Any]:
-        """
-        Tự chọn chiến lược nạp video:
-        - inline nếu video nhỏ
-        - File API nếu video lớn
-        """
-        self.state.logs.append("Tool: ingest_video()")
-
-        if not self.state.video_bytes or not self.state.video_mime:
-            return {
-                "status": "error",
-                "message": "Không có video trong phiên làm việc.",
-            }
+    def ingest_video(self):
+        if not self.state.video_bytes:
+            return {"error": "No video"}
 
         size = len(self.state.video_bytes)
 
-        if size <= self.inline_video_limit:
-            return {
-                "status": "success",
-                "strategy": "inline",
-                "message": f"Video đủ nhỏ để xử lý inline ({size} bytes).",
-            }
+        if size <= self.inline_limit:
+            return {"strategy": "inline"}
 
-        if size > self.file_api_limit:
-            return {
-                "status": "error",
-                "message": "Video vượt quá giới hạn File API 2GB.",
-            }
-
-        # Nếu đã upload rồi thì kiểm tra lại trạng thái trước khi tái sử dụng
-        if self.state.uploaded_file_name:
-            wait_result = self._wait_until_file_active(self.state.uploaded_file_name)
-            if wait_result.get("status") == "success":
-                return {
-                    "status": "success",
-                    "strategy": "file_api",
-                    "message": "Đã có file upload sẵn và file đang ở trạng thái ACTIVE.",
-                    "file_name": self.state.uploaded_file_name,
-                    "file_uri": self.state.uploaded_file_uri,
-                }
-            return wait_result
-
-        suffix = Path(self.state.video_name or "video.mp4").suffix or ".mp4"
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
             tmp.write(self.state.video_bytes)
-            tmp_path = tmp.name
+            path = tmp.name
 
-        try:
-            uploaded = self.client.files.upload(file=tmp_path)
+        uploaded = self.client.files.upload(file=path)
+        f = self._wait_active(uploaded.name)
 
-            self.state.uploaded_file_name = uploaded.name or ""
-            self.state.uploaded_file_uri = getattr(uploaded, "uri", "") or ""
+        self.state.uploaded_file_name = f.name
+        self.state.uploaded_file_uri = getattr(f, "uri", "")
+        return {"strategy": "file_api"}
 
-            wait_result = self._wait_until_file_active(self.state.uploaded_file_name)
-            if wait_result.get("status") != "success":
-                return wait_result
+    # =========================
+    # REAL TOOLS
+    # =========================
 
-            return {
-                "status": "success",
-                "strategy": "file_api",
-                "message": "Đã upload video qua File API và file đã ở trạng thái ACTIVE.",
-                "file_name": self.state.uploaded_file_name,
-                "file_uri": self.state.uploaded_file_uri,
-            }
-        finally:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-
-    def extract_transcript(self, language: str = "vi") -> dict[str, Any]:
-        self.state.logs.append(f"Tool: extract_transcript(language={language})")
+    def tool_extract_transcript(self, language_hint: str = "same_as_user_request"):
+        self.state.logs.append("Tool: extract_transcript")
 
         if self.state.transcript:
             return {
-                "status": "success",
-                "message": "Transcript đã tồn tại trong phiên làm việc.",
-                "preview": self.state.transcript[:400],
+                "transcript": self.state.transcript,
+                "source": "cached_transcript",
             }
 
-        if not self.state.video_bytes or not self.state.video_mime:
-            return {
-                "status": "error",
-                "message": "Không có video để trích xuất transcript.",
-            }
+        if not self.state.video_bytes:
+            return {"error": "No transcript and no video provided"}
 
-        ingest_result = self.ingest_video()
-        if ingest_result.get("status") != "success":
-            return ingest_result
+        ingest = self.ingest_video()
 
-        prompt = (
-            f"Hãy tạo transcript rõ ràng cho video bài giảng sau bằng ngôn ngữ {language}. "
-            "Nếu có thể, hãy chèn mốc thời gian gần đúng theo định dạng [MM:SS] ở các đoạn quan trọng. "
-            "Chỉ trả về transcript, không giải thích thêm."
-        )
+        prompt = f"""
+Hãy trích xuất transcript từ video.
 
-        strategy = ingest_result.get("strategy")
+Yêu cầu:
+- Giữ nguyên nội dung theo ngôn ngữ nói trong video.
+- Không tóm tắt.
+- Không phân tích.
+- Chỉ trả transcript rõ ràng, dễ đọc.
+- Nếu nghe không rõ một đoạn, có thể ghi [không rõ].
 
-        try:
-            if strategy == "inline":
-                response = self.client.models.generate_content(
-                    model=self.model,
-                    contents=types.Content(
-                        role="user",
-                        parts=[
-                            types.Part(
-                                inline_data=types.Blob(
-                                    data=self.state.video_bytes,
-                                    mime_type=self.state.video_mime,
-                                ),
-                                video_metadata=types.VideoMetadata(fps=1),
+Gợi ý ngôn ngữ đầu ra: {language_hint}
+"""
+
+        if ingest.get("strategy") == "inline":
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            inline_data=types.Blob(
+                                data=self.state.video_bytes,
+                                mime_type=self.state.video_mime or "video/mp4",
                             ),
-                            types.Part(text=prompt),
-                        ],
-                    ),
-                )
-            elif strategy == "file_api":
-                uploaded_file = self.client.files.get(name=self.state.uploaded_file_name)
-                state_name = self._get_file_state_name(uploaded_file)
+                            video_metadata=types.VideoMetadata(fps=1),
+                        ),
+                        types.Part(text=prompt),
+                    ],
+                ),
+            )
+        else:
+            file = self.client.files.get(name=self.state.uploaded_file_name)
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=[file, prompt],
+            )
 
-                if state_name != "ACTIVE":
-                    wait_result = self._wait_until_file_active(self.state.uploaded_file_name)
-                    if wait_result.get("status") != "success":
-                        return wait_result
-                    uploaded_file = wait_result["file"]
-
-                try:
-                    response = self.client.models.generate_content(
-                        model=self.model,
-                        contents=[
-                            uploaded_file,
-                            prompt,
-                        ],
-                    )
-                except Exception as e:
-                    error_text = str(e)
-                    if "FAILED_PRECONDITION" in error_text:
-                        self.state.logs.append(
-                            "generate_content gặp FAILED_PRECONDITION, chờ file ACTIVE rồi thử lại 1 lần."
-                        )
-                        wait_result = self._wait_until_file_active(self.state.uploaded_file_name)
-                        if wait_result.get("status") != "success":
-                            return wait_result
-
-                        uploaded_file = wait_result["file"]
-                        response = self.client.models.generate_content(
-                            model=self.model,
-                            contents=[
-                                uploaded_file,
-                                prompt,
-                            ],
-                        )
-                    else:
-                        raise
-            else:
-                return {
-                    "status": "error",
-                    "message": f"Chiến lược video không hợp lệ: {strategy}",
-                }
-
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Lỗi khi trích xuất transcript: {str(e)}",
-            }
-
-        transcript = (response.text or "").strip()
-        self.state.transcript = transcript
+        text = (response.text or "").strip()
+        self.state.transcript = text
 
         return {
-            "status": "success",
-            "message": f"Đã trích xuất transcript bằng chiến lược {strategy}.",
-            "preview": transcript[:400],
+            "transcript": text,
+            "source": "video_extracted",
         }
 
-    def search_topic_timestamp(self, topic: str) -> dict[str, Any]:
-        """Tìm chủ đề trong transcript và trả về mốc thời gian gần đúng."""
-        self.state.logs.append(f"Tool: search_topic_timestamp(topic={topic})")
+    def tool_search_topic(self, topic: str):
+        self.state.logs.append(f"Tool: search_topic(topic={topic})")
 
         if not self.state.transcript:
             return {
-                "status": "error",
-                "message": "Chưa có transcript để tìm kiếm chủ đề.",
+                "chu_de": topic,
+                "co_tim_thay": False,
+                "moc_thoi_gian": None,
+                "doan_lien_quan": None,
             }
 
         prompt = f"""
-Bạn là công cụ tìm kiếm chủ đề trong transcript bài giảng.
-Chủ đề cần tìm: {topic}
+Dựa trên transcript dưới đây, hãy xác định chủ đề "{topic}" có xuất hiện hay không.
 
 Yêu cầu:
-- Nếu transcript có mốc thời gian dạng [MM:SS], hãy tận dụng để trả về moc_thoi_gian.
-- Nếu không có mốc thời gian rõ ràng, hãy suy ra gần đúng nếu đủ cơ sở, nếu không thì để null.
-- doan_lien_quan phải là đoạn ngắn nhất nhưng đủ nghĩa.
-- Chỉ trả JSON hợp lệ theo schema.
-
-Schema:
-{{
-  "chu_de": "string",
-  "co_tim_thay": true,
-  "moc_thoi_gian": "MM:SS hoặc null",
-  "doan_lien_quan": "string hoặc null"
-}}
+- Trả về JSON với đúng các khóa:
+  - chu_de
+  - co_tim_thay
+  - moc_thoi_gian
+  - doan_lien_quan
+- `co_tim_thay` là true hoặc false.
+- `moc_thoi_gian` dùng MM:SS nếu suy ra được, nếu không chắc thì để null.
+- `doan_lien_quan` là đoạn ngắn bám sát transcript, nếu không có thì để null.
+- Không bịa.
 
 Transcript:
 {self.state.transcript[:20000]}
-""".strip()
+"""
 
         response = self.client.models.generate_content(
             model=self.model,
             contents=prompt,
-            config={
-                "response_mime_type": "application/json",
-                "response_json_schema": {
-                    "type": "object",
-                    "properties": {
-                        "chu_de": {"type": "string"},
-                        "co_tim_thay": {"type": "boolean"},
-                        "moc_thoi_gian": {"type": ["string", "null"]},
-                        "doan_lien_quan": {"type": ["string", "null"]},
-                    },
-                    "required": ["chu_de", "co_tim_thay", "moc_thoi_gian", "doan_lien_quan"],
-                },
-            },
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=TopicSearchResult,
+            ),
         )
-        result = json.loads(response.text)
-        return {"status": "success", **result}
 
-    def save_result(self, filename: str = "") -> dict[str, Any]:
-        """Đánh dấu lưu JSON kết quả cuối."""
-        self.state.logs.append(f"Tool: save_result(filename={filename})")
-        self.state.save_requested = True
-        self.state.filename_hint = filename or self.state.filename_hint
-        return {
-            "status": "scheduled",
-            "message": "Kết quả cuối cùng sẽ được lưu sau khi phân tích xong.",
-        }
+        parsed = getattr(response, "parsed", None)
+        if parsed is None:
+            data = json.loads(response.text)
+            parsed = TopicSearchResult.model_validate(data)
 
-    def export_report(self, format: str = "md", send_email: bool = False, email_to: str = "") -> dict[str, Any]:
-        """Đánh dấu xuất báo cáo hoặc gửi email sau khi có kết quả cuối."""
-        self.state.logs.append(
-            f"Tool: export_report(format={format}, send_email={send_email}, email_to={email_to})"
-        )
-        self.state.export_requested = True
-        self.state.export_format = (format or "md").lower()
-        self.state.send_email_requested = send_email
-        self.state.email_to = email_to or ""
-        return {
-            "status": "scheduled",
-            "message": "Báo cáo sẽ được xuất sau khi phân tích xong.",
-            "format": self.state.export_format,
-            "send_email": self.state.send_email_requested,
-        }
+        return parsed.model_dump()
 
     # =========================
-    # Internal helpers
+    # EMAIL (POST-PROCESS ONLY)
     # =========================
-    def _call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        if tool_name == "extract_transcript" and self.state.transcript:
+
+    def tool_send_email_report(
+        self,
+        to_email: str,
+        subject: str,
+        report_content: str,
+        content_format: str = "plain",
+    ):
+        self.state.logs.append(f"Tool: send_email_report(to={to_email})")
+
+        smtp_host = os.getenv("SMTP_HOST")
+        smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        smtp_username = os.getenv("SMTP_USERNAME")
+        smtp_password = os.getenv("SMTP_PASSWORD")
+        smtp_from = os.getenv("SMTP_FROM", smtp_username)
+
+        if not smtp_host or not smtp_username or not smtp_password or not smtp_from:
             return {
-                "status": "success",
-                "message": "Transcript đã có sẵn, không cần gọi lại.",
-                "preview": self.state.transcript[:400],
-            }
-
-        if tool_name == "ingest_video" and self.state.uploaded_file_name:
-            wait_result = self._wait_until_file_active(self.state.uploaded_file_name)
-            if wait_result.get("status") == "success":
-                return {
-                    "status": "success",
-                    "strategy": "file_api",
-                    "message": "Video đã được ingest trước đó và file đang ở trạng thái ACTIVE.",
-                    "file_name": self.state.uploaded_file_name,
-                    "file_uri": self.state.uploaded_file_uri,
-                }
-            return wait_result
-
-        tool_map = {
-            "ingest_video": self.ingest_video,
-            "extract_transcript": self.extract_transcript,
-            "search_topic_timestamp": self.search_topic_timestamp,
-            "save_result": self.save_result,
-            "export_report": self.export_report,
-        }
-
-        if tool_name not in tool_map:
-            return {
-                "status": "error",
-                "message": f"Tool không tồn tại: {tool_name}",
+                "success": False,
+                "message": "Thiếu cấu hình SMTP trong biến môi trường.",
             }
 
         try:
-            return tool_map[tool_name](**arguments)
-        except Exception as e:
+            msg = MIMEMultipart()
+            msg["From"] = smtp_from
+            msg["To"] = to_email
+            msg["Subject"] = subject
+
+            mime_type = "html" if content_format == "html" else "plain"
+            msg.attach(MIMEText(report_content, mime_type, "utf-8"))
+
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.starttls()
+                server.login(smtp_username, smtp_password)
+                server.sendmail(smtp_from, to_email, msg.as_string())
+
             return {
-                "status": "error",
-                "message": f"Lỗi khi gọi tool {tool_name}: {str(e)}",
+                "success": True,
+                "message": f"Đã gửi báo cáo tới {to_email}",
             }
 
-    def _build_agent_loop_schema(self) -> dict[str, Any]:
-        return AgentLoopResponse.model_json_schema()
+        except Exception as exc:
+            return {
+                "success": False,
+                "message": f"Gửi email thất bại: {str(exc)}",
+            }
 
-    def _slugify(self, value: str) -> str:
-        value = value.strip().lower()
-        value = re.sub(r"[^a-z0-9-_]+", "-", value)
-        value = re.sub(r"-+", "-", value).strip("-")
-        return value or "result"
+    def _build_email_content(self, result: dict) -> str:
+        lines: list[str] = []
 
-    def _base_name(self, result: LearningOutput) -> str:
-        hint = self.state.filename_hint or result.chu_de or self.state.video_name or "learning-output"
-        return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{self._slugify(hint)}"
+        lines.append("BÁO CÁO HỌC TẬP TỪ VIDEO BÀI GIẢNG")
+        lines.append("")
+        lines.append(f"Chủ đề: {result.get('chu_de', 'Không xác định')}")
+        lines.append("")
 
-    def _save_result_file(self, result: LearningOutput) -> Path:
-        path = self.output_dir / f"{self._base_name(result)}.json"
-        path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
-        self.state.logs.append(f"Saved JSON: {path}")
-        return path
+        lines.append("Tóm tắt:")
+        for item in result.get("tom_tat", []):
+            lines.append(f"- {item}")
+        lines.append("")
 
-    def _render_markdown_report(self, result: LearningOutput) -> str:
-        lines = [
-            f"# Báo cáo học tập: {result.chu_de}",
-            "",
-            "## Tóm tắt",
-        ]
-        lines.extend([f"- {item}" for item in result.tom_tat])
-        lines.extend(["", "## Ý chính"])
-        lines.extend([f"- {item}" for item in result.y_chinh])
-        lines.extend(["", "## Câu hỏi trắc nghiệm"])
-        for idx, q in enumerate(result.cau_hoi_trac_nghiem, start=1):
-            lines.extend(
-                [
-                    f"### Câu {idx}",
-                    q.cau_hoi,
-                    f"- A. {q.lua_chon.A}",
-                    f"- B. {q.lua_chon.B}",
-                    f"- C. {q.lua_chon.C}",
-                    f"- D. {q.lua_chon.D}",
-                    f"**Đáp án đúng:** {q.dap_an_dung}",
-                    "",
-                ]
-            )
-        if result.ket_qua_tim_chu_de:
-            lines.extend(
-                [
-                    "## Kết quả tìm chủ đề",
-                    f"- Chủ đề: {result.ket_qua_tim_chu_de.chu_de}",
-                    f"- Có tìm thấy: {'Có' if result.ket_qua_tim_chu_de.co_tim_thay else 'Không'}",
-                    f"- Mốc thời gian: {result.ket_qua_tim_chu_de.moc_thoi_gian or 'Không có'}",
-                    f"- Đoạn liên quan: {result.ket_qua_tim_chu_de.doan_lien_quan or 'Không có'}",
-                    "",
-                ]
-            )
-        if result.ghi_chu_agent:
-            lines.extend(["## Ghi chú agent", result.ghi_chu_agent, ""])
+        lines.append("Ý chính:")
+        for item in result.get("y_chinh", []):
+            lines.append(f"- {item}")
+        lines.append("")
+
+        questions = result.get("cau_hoi_trac_nghiem", [])
+        if questions:
+            lines.append("Câu hỏi trắc nghiệm:")
+            for idx, q in enumerate(questions, start=1):
+                lines.append(f"{idx}. {q['cau_hoi']}")
+                options = q["lua_chon"]
+                lines.append(f"   A. {options['A']}")
+                lines.append(f"   B. {options['B']}")
+                lines.append(f"   C. {options['C']}")
+                lines.append(f"   D. {options['D']}")
+                lines.append(f"   Đáp án đúng: {q['dap_an_dung']}")
+                lines.append("")
+
+        topic_result = result.get("ket_qua_tim_chu_de")
+        if topic_result:
+            lines.append("Kết quả tìm chủ đề:")
+            lines.append(f"- Chủ đề: {topic_result.get('chu_de')}")
+            lines.append(f"- Có tìm thấy: {topic_result.get('co_tim_thay')}")
+            lines.append(f"- Mốc thời gian: {topic_result.get('moc_thoi_gian')}")
+            lines.append(f"- Đoạn liên quan: {topic_result.get('doan_lien_quan')}")
+            lines.append("")
+
+        if result.get("ghi_chu_agent"):
+            lines.append("Ghi chú agent:")
+            lines.append(result["ghi_chu_agent"])
+
         return "\n".join(lines)
 
-    def _export_report_file(self, result: LearningOutput) -> Path:
-        format_name = self.state.export_format.lower()
-        base = self.output_dir / self._base_name(result)
-        if format_name == "html":
-            md = self._render_markdown_report(result)
-            html = (
-                "<html><body><pre style='white-space: pre-wrap; font-family: Arial;'>"
-                + md
-                + "</pre></body></html>"
-            )
-            path = base.with_suffix(".html")
-            path.write_text(html, encoding="utf-8")
-        else:
-            path = base.with_suffix(".md")
-            path.write_text(self._render_markdown_report(result), encoding="utf-8")
-        self.state.logs.append(f"Exported report: {path}")
-        return path
-
-    def _send_email_if_configured(self, report_path: Path) -> Optional[str]:
-        if not self.state.send_email_requested or not self.state.email_to:
+    def _extract_email_request(self, user_request: str) -> Optional[str]:
+        lower_req = user_request.lower()
+        if "email" not in lower_req and "mail" not in lower_req and "gửi" not in lower_req:
             return None
 
-        smtp_host = os.getenv("SMTP_HOST")
-        smtp_port = os.getenv("SMTP_PORT")
-        smtp_user = os.getenv("SMTP_USER")
-        smtp_password = os.getenv("SMTP_PASSWORD")
-        smtp_sender = os.getenv("SMTP_SENDER", smtp_user or "")
+        match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', user_request)
+        if match:
+            return match.group(0)
 
-        if not all([smtp_host, smtp_port, smtp_user, smtp_password, smtp_sender]):
-            msg = "Email đã được yêu cầu nhưng chưa cấu hình đủ SMTP_* trong môi trường."
-            self.state.logs.append(msg)
-            return msg
+        return None
 
-        email = EmailMessage()
-        email["Subject"] = "Báo cáo học tập từ AI Video Learning Assistant"
-        email["From"] = smtp_sender
-        email["To"] = self.state.email_to
-        email.set_content(report_path.read_text(encoding="utf-8"))
+    # =========================
+    # TOOL DECLARATIONS
+    # =========================
 
-        with smtplib.SMTP(smtp_host, int(smtp_port)) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_password)
-            server.send_message(email)
-
-        msg = f"Đã gửi email tới {self.state.email_to}."
-        self.state.logs.append(msg)
-        return msg
-
-    def _build_system_instruction(
-        self,
-        summary_lines: Optional[int],
-        key_points: Optional[int],
-        quiz_count: Optional[int],
-        language: str,
-    ) -> str:
-        constraints = [f"- Ngôn ngữ đầu ra: {language}"]
-
-        if summary_lines is not None:
-            constraints.append(f"- Tóm tắt đúng {summary_lines} dòng ngắn gọn, dễ hiểu.")
-        else:
-            constraints.append(
-                "- Tự quyết định số dòng tóm tắt sao cho đủ ý, ngắn gọn và hợp lý với độ dài nội dung, thường trong khoảng 3–7 dòng."
+    def _tools(self):
+        return [
+            types.Tool(
+                function_declarations=[
+                    types.FunctionDeclaration(
+                        name="extract_transcript",
+                        description=(
+                            "Trích xuất transcript từ video khi chưa có transcript. "
+                            "Chỉ gọi tool này nếu transcript chưa có sẵn."
+                        ),
+                        parameters={
+                            "type": "object",
+                            "properties": {
+                                "language_hint": {
+                                    "type": "string",
+                                    "description": "Ngôn ngữ gợi ý cho transcript/output",
+                                }
+                            },
+                        },
+                    ),
+                    types.FunctionDeclaration(
+                        name="search_topic",
+                        description=(
+                            "Tìm một chủ đề cụ thể trong transcript khi người dùng yêu cầu "
+                            "xác định xem bài giảng có nhắc tới chủ đề đó hay không."
+                        ),
+                        parameters={
+                            "type": "object",
+                            "properties": {
+                                "topic": {
+                                    "type": "string",
+                                    "description": "Chủ đề cần tìm trong transcript",
+                                }
+                            },
+                            "required": ["topic"],
+                        },
+                    ),
+                ]
             )
-
-        if key_points is not None:
-            constraints.append(f"- Trích xuất đúng {key_points} ý chính.")
-        else:
-            constraints.append(
-                "- Tự quyết định số ý chính sao cho bao quát nội dung quan trọng, tránh trùng lặp, thường trong khoảng 4–8 ý."
-            )
-
-        if quiz_count is not None:
-            constraints.append(
-                f"- Tạo đúng {quiz_count} câu hỏi trắc nghiệm, mỗi câu có 4 lựa chọn A/B/C/D và 1 đáp án đúng."
-            )
-        else:
-            constraints.append(
-                "- Tự quyết định số câu hỏi trắc nghiệm phù hợp với nội dung, ưu tiên chất lượng hơn số lượng, thường trong khoảng 3–6 câu."
-            )
-
-        constraint_text = "\n".join(constraints)
-
-        return f"""
-Bạn là AI Video Learning Agent.
-
-Chỉ chọn:
-- action="tool" khi thật sự cần công cụ
-- action="final" khi đã đủ dữ liệu
-
-Tool:
-- ingest_video
-- extract_transcript
-- search_topic_timestamp
-- save_result
-- export_report
-
-Quy tắc:
-- Nếu đã có transcript thì không gọi extract_transcript.
-- Chỉ gọi search_topic_timestamp khi người dùng yêu cầu mốc thời gian/chủ đề.
-- Chỉ gọi save_result/export_report khi người dùng yêu cầu.
-- Ưu tiên hoàn tất trong ít bước nhất.
-- Nếu đủ dữ liệu thì trả final ngay.
-
-Rằng buộc đầu ra cuối:
-Ngôn ngữ đầu ra: {language}
-""".strip()
-
-    def _build_effective_user_request(
-        self,
-        user_request: str,
-        auto_save: bool,
-        auto_export: bool,
-        export_format: str,
-        email_to: str,
-        send_email: bool,
-    ) -> str:
-        extra_instructions: list[str] = []
-        if auto_save:
-            extra_instructions.append("Sau khi hoàn tất, hãy lưu kết quả JSON.")
-        if auto_export:
-            if send_email and email_to:
-                extra_instructions.append(
-                    f"Sau khi hoàn tất, hãy xuất báo cáo dạng {export_format} và gửi email tới {email_to}."
-                )
-            else:
-                extra_instructions.append(f"Sau khi hoàn tất, hãy xuất báo cáo dạng {export_format}.")
-
-        if not extra_instructions:
-            return user_request.strip()
-
-        return (user_request.strip() + "\n\nYêu cầu bổ sung từ giao diện:\n- " + "\n- ".join(extra_instructions)).strip()
-
-    def _run_full_agentic_session(
-        self,
-        user_request: str,
-        summary_lines: Optional[int],
-        key_points: Optional[int],
-        quiz_count: Optional[int],
-        language: str,
-    ) -> LearningOutput:
-        system_instruction = self._build_system_instruction(
-            summary_lines=summary_lines,
-            key_points=key_points,
-            quiz_count=quiz_count,
-            language=language,
-        )
-
-        loop_schema = self._build_agent_loop_schema()
-
-        state_context = {
-            "co_transcript_san": bool(self.state.transcript),
-            "co_video_san": bool(self.state.video_bytes),
-            "video_name": self.state.video_name,
-        }
-
-        messages: list[str] = [
-            "Người dùng yêu cầu:",
-            user_request,
-            "",
-            "Trạng thái hiện tại:",
-            json.dumps(state_context, ensure_ascii=False),
         ]
 
-        max_steps = 5
+    # =========================
+    # AGENT LOOP
+    # =========================
 
-        for step in range(max_steps):
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents="\n".join(messages),
-                config={
-                    "system_instruction": system_instruction,
-                    "response_mime_type": "application/json",
-                    "response_json_schema": loop_schema,
-                },
+    def _build_initial_contents(self, user_request: str):
+        parts: list[Any] = [
+            types.Part(text=f"Yêu cầu người dùng:\n{user_request}")
+        ]
+
+        if self.state.transcript:
+            parts.append(
+                types.Part(
+                    text=(
+                        "Transcript đã được cung cấp sẵn bởi người dùng. "
+                        "Nếu cần dùng, hãy đọc transcript này thay vì gọi extract_transcript.\n\n"
+                        f"{self.state.transcript[:30000]}"
+                    )
+                )
             )
-
-            data = AgentLoopResponse.model_validate_json(response.text)
-
-            thought = data.thought
-            action = data.action
-            tool_name = data.tool_name
-            tool_args = data.tool_args or {}
-            final_answer = data.final_answer
-
-            self.state.logs.append(f"Agent step {step + 1}: {thought}")
-
-            if action == "tool":
-                tool_result = self._call_tool(tool_name, tool_args)
-                self.state.logs.append(
-                    f"Tool executed: {tool_name} | args={tool_args} | result={tool_result}"
+        else:
+            if self.state.video_bytes:
+                parts.append(
+                    types.Part(
+                        text=(
+                            "Hiện chưa có transcript nhưng có video đầu vào. "
+                            "Nếu cần nội dung bài giảng, hãy gọi tool extract_transcript."
+                        )
+                    )
+                )
+            else:
+                parts.append(
+                    types.Part(
+                        text="Không có transcript và cũng không có video."
+                    )
                 )
 
-                messages.append(f"\nBước {step + 1} - thought: {thought}")
-                messages.append(f"Hành động: gọi tool {tool_name}")
-                messages.append(f"Kết quả tool: {json.dumps(tool_result, ensure_ascii=False)}")
-                continue
+        return [
+            types.Content(
+                role="user",
+                parts=parts,
+            )
+        ]
 
-            if action == "final":
-                if final_answer is None:
-                    raise ValueError("Model trả action='final' nhưng không có final_answer.")
-                return final_answer
+    def _system_instruction(self) -> str:
+        return """
+Bạn là AI hỗ trợ học từ video bài giảng.
 
-            raise ValueError(f"Action không hợp lệ: {action}")
+Mục tiêu:
+- Phân tích nội dung bài giảng.
+- Tạo đầu ra học tập có cấu trúc.
+- Chỉ dùng tool khi thật sự cần.
 
-        raise RuntimeError("Agent vượt quá số bước tối đa nhưng vẫn chưa hoàn tất.")
+Quy tắc làm việc:
+1. Nếu transcript đã có sẵn trong ngữ cảnh, KHÔNG gọi `extract_transcript`.
+2. Nếu transcript chưa có mà có video, hãy gọi `extract_transcript`.
+3. Nếu người dùng yêu cầu tìm một chủ đề cụ thể trong bài giảng, hãy tự xác định chủ đề đó từ yêu cầu và gọi `search_topic`.
+4. Nếu người dùng không yêu cầu tìm chủ đề cụ thể, không cần gọi `search_topic`.
+5. Sau khi đã có đủ dữ liệu, hãy trả ra kết quả cuối cùng theo đúng schema mong muốn.
+6. Toàn bộ output phải cùng ngôn ngữ với yêu cầu của người dùng.
+7. Không bịa nội dung ngoài transcript.
+8. Không gọi bất kỳ tool gửi email nào. Việc gửi email sẽ được xử lý sau khi kết quả cuối cùng đã được tạo.
 
-    # =========================
-    # Public entrypoint
-    # =========================
-    def process(
-        self,
-        user_request: str,
-        transcript: Optional[str] = None,
-        video_bytes: Optional[bytes] = None,
-        video_mime: Optional[str] = None,
-        video_name: Optional[str] = None,
-        summary_lines: Optional[int] = None,
-        key_points: Optional[int] = None,
-        quiz_count: Optional[int] = None,
-        language: str = "vi",
-        auto_save: bool = False,
-        auto_export: bool = False,
-        export_format: str = "md",
-        send_email: bool = False,
-        email_to: str = "",
-    ) -> dict[str, Any]:
-        self.reset_state(
-            transcript=transcript,
-            video_bytes=video_bytes,
-            video_mime=video_mime,
-            video_name=video_name,
+Schema đầu ra cần thỏa:
+- chu_de
+- tom_tat (3-8 ý)
+- y_chinh (3-8 ý)
+- cau_hoi_trac_nghiem (1-10 câu)
+- ket_qua_tim_chu_de (null nếu user không yêu cầu)
+- ghi_chu_agent
+
+Ràng buộc quiz:
+- Mỗi câu hỏi phải có đúng 4 lựa chọn A/B/C/D
+- dap_an_dung chỉ được là A, B, C hoặc D
+"""
+
+    def _execute_tool(self, name: str, args: dict):
+        if name == "extract_transcript":
+            return self.tool_extract_transcript(**args)
+
+        if name == "search_topic":
+            return self.tool_search_topic(**args)
+
+        return {"error": f"unknown tool: {name}"}
+
+    def run(self, user_request: str) -> dict:
+        contents = self._build_initial_contents(user_request)
+
+        # BƯỚC 1: agent loop với tools, KHÔNG ép JSON/schema
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                tools=self._tools(),
+                system_instruction=self._system_instruction(),
+            ),
         )
-        self.state.logs.append("Process started")
 
-        if not self.state.transcript and not self.state.video_bytes:
-            raise ValueError("Bạn cần cung cấp transcript hoặc video để hệ thống phân tích.")
+        max_steps = 4
+        step = 0
 
-        effective_request = self._build_effective_user_request(
-            user_request=user_request,
-            auto_save=auto_save,
-            auto_export=auto_export,
-            export_format=export_format,
-            email_to=email_to,
-            send_email=send_email,
+        while step < max_steps:
+            step += 1
+            candidate = response.candidates[0]
+            parts = candidate.content.parts
+
+            function_calls = [
+                part.function_call
+                for part in parts
+                if getattr(part, "function_call", None)
+            ]
+
+            if not function_calls:
+                break
+
+            assistant_content = candidate.content
+            tool_response_parts: list[Any] = []
+
+            for fc in function_calls:
+                name = fc.name
+                args = dict(fc.args or {})
+                result = self._execute_tool(name, args)
+
+                tool_response_parts.append(
+                    types.Part.from_function_response(
+                        name=name,
+                        response={"result": result},
+                    )
+                )
+
+            tool_content = types.Content(
+                role="tool",
+                parts=tool_response_parts,
+            )
+
+            contents = [
+                *contents,
+                assistant_content,
+                tool_content,
+            ]
+
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    tools=self._tools(),
+                    system_instruction=self._system_instruction(),
+                ),
+            )
+
+        # BƯỚC 2: gọi riêng để ép output về schema JSON
+        final_prompt = """
+Hãy tạo kết quả cuối cùng theo đúng schema LearningOutput.
+
+Yêu cầu:
+- Dựa trên toàn bộ ngữ cảnh hội thoại và kết quả tool đã có.
+- Không gọi thêm tool.
+- Trả đúng JSON theo schema.
+- `ket_qua_tim_chu_de` là null nếu người dùng không yêu cầu tìm chủ đề cụ thể.
+- Toàn bộ output phải cùng ngôn ngữ với yêu cầu của người dùng.
+"""
+
+        final_response = self.client.models.generate_content(
+            model=self.model,
+            contents=[
+                *contents,
+                types.Content(
+                    role="user",
+                    parts=[types.Part(text=final_prompt)],
+                ),
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=self._system_instruction(),
+                response_mime_type="application/json",
+                response_schema=LearningOutput,
+            ),
         )
 
-        result = self._run_full_agentic_session(
-            user_request=effective_request,
-            summary_lines=summary_lines,
-            key_points=key_points,
-            quiz_count=quiz_count,
-            language=language,
-        )
+        parsed = getattr(final_response, "parsed", None)
 
-        files: dict[str, str] = {}
-        if self.state.save_requested:
-            files["json"] = str(self._save_result_file(result))
+        if parsed is None:
+            try:
+                data = json.loads(final_response.text)
+                parsed = LearningOutput.model_validate(data)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Model không trả được output hợp lệ theo schema. Raw response: {final_response.text}"
+                ) from exc
 
-        if self.state.export_requested:
-            report_path = self._export_report_file(result)
-            files["report"] = str(report_path)
-            email_status = self._send_email_if_configured(report_path)
-        else:
-            email_status = None
+        result = parsed.model_dump()
 
-        self.state.logs.append("Process finished")
+        if not result.get("ghi_chu_agent"):
+            result["ghi_chu_agent"] = "; ".join(self.state.logs) if self.state.logs else "Không dùng tool"
+
+        # BƯỚC 3: gửi email sau khi đã có LearningOutput cuối
+        email_status = None
+        to_email = self._extract_email_request(user_request)
+
+        if to_email:
+            email_content = self._build_email_content(result)
+            email_status = self.tool_send_email_report(
+                to_email=to_email,
+                subject=f"Báo cáo học tập: {result.get('chu_de', 'Video bài giảng')}",
+                report_content=email_content,
+                content_format="plain",
+            )
+            self.state.logs.append(f"Post-process email status: {email_status}")
 
         return {
-            "result": result.model_dump(),
+            "result": result,
+            "files": {},
             "logs": self.state.logs,
-            "files": files,
             "email_status": email_status,
-            "state": {
-                "save_requested": self.state.save_requested,
-                "export_requested": self.state.export_requested,
-                "export_format": self.state.export_format,
-                "send_email_requested": self.state.send_email_requested,
-                "email_to": self.state.email_to,
-                "has_transcript": bool(self.state.transcript),
-            },
         }
