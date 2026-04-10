@@ -285,19 +285,65 @@ Chỉ trả về nội dung đã dịch, không giải thích, không thêm tiê
             return []
 
         prompt = f"""
-Bạn đang chuẩn bị truy vấn Wikipedia tiếng Anh cho một agent học từ video.
+[ROLE]
+Bạn là hệ thống tạo truy vấn tìm kiếm Wikipedia tiếng Anh.
 
-Nhiệm vụ:
-- Tạo các truy vấn tìm kiếm Wikipedia khả dĩ nhất cho đúng chủ đề.
-- Tự suy luận cách diễn đạt tương đương, tên gọi phổ biến hơn, tên tiếng Anh, tên học thuật,
-  tên riêng, sự kiện liên quan trực tiếp, và cách viết không dấu nếu hữu ích.
-- Không tạo truy vấn quá rộng hoặc lệch chủ đề.
-- Ưu tiên 3 đến 6 truy vấn ngắn, có khả năng khớp với tiêu đề bài Wikipedia.
+[GOAL]
+Sinh ra các truy vấn tìm kiếm tối ưu để tìm đúng bài Wikipedia liên quan đến chủ đề.
 
+---
+
+[INPUT]
 Chủ đề:
 {topic}
 
-Trả đúng JSON:
+---
+
+[QUERY GENERATION STRATEGY]
+Bạn cần suy luận và tạo các biến thể truy vấn dựa trên:
+
+- tên chính xác của chủ đề
+- tên tiếng Anh (nếu có)
+- tên gọi phổ biến hơn
+- tên học thuật hoặc chính thức
+- tên sự kiện hoặc nhân vật liên quan trực tiếp
+- cách viết không dấu hoặc biến thể đơn giản hơn (nếu hữu ích)
+
+---
+
+[QUALITY RULES]
+- Mỗi query phải:
+  - ngắn gọn (2-6 từ)
+  - rõ nghĩa
+  - có khả năng khớp với tiêu đề Wikipedia
+
+- Ưu tiên:
+  - danh từ riêng
+  - tên sự kiện
+  - tên nhân vật
+  - khái niệm chính xác
+
+---
+
+[CONSTRAINTS]
+- KHÔNG tạo query quá chung chung (ví dụ: "history", "lesson")
+- KHÔNG lệch chủ đề
+- KHÔNG giải thích
+- KHÔNG thêm văn bản ngoài JSON
+- KHÔNG tạo query vô nghĩa hoặc trùng lặp
+
+---
+
+[OUTPUT RULES]
+- Trả từ 3 đến 6 queries
+- Mỗi query là một chuỗi ngắn
+- Không lặp lại ý nghĩa
+
+---
+
+[OUTPUT FORMAT]
+Chỉ trả JSON hợp lệ:
+
 {{
   "queries": ["query 1", "query 2", "query 3"]
 }}
@@ -366,17 +412,49 @@ Trả đúng JSON:
             raise RuntimeError(ingest["error"])
 
         prompt = """
-Hãy trích xuất transcript từ video.
+[ROLE]
+Bạn là hệ thống trích xuất lời nói từ video bài giảng.
 
-Yêu cầu:
-- Nếu có thể, gắn timestamp gần đúng theo dạng [MM:SS] ở đầu câu hoặc đoạn.
-- Ví dụ:
-  [00:15] Hai Bà Trưng nổi dậy chống nhà Hán
-- Giữ nguyên ngôn ngữ nói trong video.
-- Không tóm tắt.
-- Không phân tích.
-- Nếu không nghe rõ thì ghi [không rõ].
-- Nếu không xác định được timestamp ở một đoạn thì không được bịa timestamp.
+[GOAL]
+Trích xuất transcript từ video một cách trung thực, đầy đủ và bám sát nội dung audio.
+
+[INSTRUCTIONS]
+
+* Chuyển toàn bộ lời nói trong video thành văn bản.
+* Giữ nguyên ngôn ngữ gốc được nói trong video.
+* Nếu có thể xác định được mốc thời gian, hãy đặt timestamp gần đúng theo định dạng [MM:SS] ở đầu câu hoặc đoạn.
+* Nếu một đoạn không nghe rõ, ghi [không rõ].
+* Giữ nội dung theo đúng thứ tự xuất hiện trong video.
+
+[TRANSCRIPT RULES]
+
+* Transcript phải bám sát lời nói thực tế trong video.
+* Không được rút gọn ý.
+* Không được diễn giải lại theo cách khác.
+* Không được thêm thông tin không xuất hiện trong audio.
+* Không được sửa nội dung theo suy đoán.
+
+[TIMESTAMP RULES]
+
+* Chỉ thêm timestamp khi có đủ căn cứ từ video.
+* Timestamp phải ở dạng [MM:SS].
+* Nếu không xác định được timestamp ở một đoạn, bỏ qua timestamp cho đoạn đó.
+* Không được bịa timestamp.
+
+[CONSTRAINTS]
+
+* Không tóm tắt.
+* Không phân tích.
+* Không nhận xét.
+* Không trả thêm giải thích.
+
+[OUTPUT FORMAT]
+Chỉ trả về transcript thuần.
+Ví dụ:
+[00:15] Hai Bà Trưng nổi dậy chống nhà Hán
+[00:22] [không rõ]
+Nội dung tiếp theo...
+
 """
 
         if ingest["strategy"] == "inline":
@@ -462,35 +540,69 @@ Yêu cầu người dùng:
             return result
 
         prompt = f"""
-Bạn là bộ phân tích ngữ nghĩa cho transcript bài giảng.
+[ROLE]
+Bạn là hệ thống phân tích ngữ nghĩa transcript video bài giảng.
 
-Nhiệm vụ:
-- Xác định transcript có nói về chủ đề người dùng hỏi hay không.
-- Được phép suy luận theo NGHĨA, không yêu cầu trùng khớp nguyên văn.
-- Nếu transcript có timestamp dạng [MM:SS], hãy trả về mốc thời gian gần nhất của đoạn liên quan.
-- Không được bịa timestamp nếu transcript không có hoặc không đủ chắc chắn.
+[GOAL]
+Xác định liệu transcript có đề cập đến chủ đề người dùng hỏi hay không.
+
+---
+
+[INPUT]
+Chủ đề cần kiểm tra:
+{topic}
+
+Transcript:
+{text[:10000]}
+
+---
+
+[SEMANTIC MATCHING RULE]
+- Không yêu cầu trùng từ khóa chính xác.
+- Được phép suy luận theo NGHĨA.
+- Nếu nội dung có cùng bản chất, sự kiện, nhân vật hoặc khái niệm → coi là liên quan.
 
 Ví dụ:
-- Nếu topic là "cuộc khởi nghĩa Hai Bà Trưng" và transcript chỉ nói "Hai Bà Trưng nổi dậy chống nhà Hán"
-  thì vẫn xem là có liên quan.
+- Topic: "cuộc khởi nghĩa Hai Bà Trưng"
+- Transcript: "Hai Bà Trưng nổi dậy chống nhà Hán"
+→ Vẫn coi là có liên quan
 
-Yêu cầu:
-- Chỉ dựa trên transcript.
-- Không bịa.
-- Nếu không chắc, ưu tiên trả false.
-- Trả đúng JSON:
+---
+
+[DECISION RULE]
+- Nếu tìm thấy nội dung liên quan rõ ràng → co_tim_thay = true
+- Nếu không có hoặc không đủ chắc chắn → co_tim_thay = false
+- Nếu phân vân → ưu tiên false (tránh suy đoán sai)
+
+---
+
+[TIMESTAMP RULE]
+- Chỉ trả `moc_thoi_gian` nếu:
+  - transcript có timestamp dạng [MM:SS]
+  - và đoạn liên quan nằm gần timestamp đó
+- Nếu không có timestamp rõ ràng → moc_thoi_gian = null
+- KHÔNG được tự suy đoán timestamp
+
+---
+
+[CONSTRAINTS]
+- CHỈ sử dụng thông tin từ transcript
+- KHÔNG dùng kiến thức bên ngoài
+- KHÔNG suy diễn vượt quá nội dung transcript
+- KHÔNG bịa nội dung
+- KHÔNG trả thêm giải thích
+
+---
+
+[OUTPUT FORMAT]
+Chỉ trả JSON hợp lệ:
+
 {{
   "chu_de": "{topic}",
   "co_tim_thay": true hoặc false,
   "moc_thoi_gian": "MM:SS" hoặc null,
   "doan_lien_quan": "trích đoạn ngắn liên quan" hoặc null
 }}
-
-Chủ đề cần kiểm tra:
-{topic}
-
-Transcript:
-{text[:10000]}
 """
 
         try:
@@ -644,47 +756,103 @@ Transcript:
         self.state.logs.append("tool=planner")
 
         prompt = f"""
-Bạn là planner cho một autonomous agent phân tích video bài giảng.
+[ROLE]
+Bạn là planner của một autonomous agent phân tích video bài giảng.
 
-Nhiệm vụ:
-- Chọn đúng 1 action tiếp theo để hoàn thành yêu cầu người dùng.
-- Làm theo kiểu ReAct: Reason -> Act -> Observe.
-- Tự suy luận từ mục tiêu của người dùng, không phụ thuộc máy móc vào từ khóa.
-- Nếu người dùng muốn biết thêm, hiểu sâu hơn, có thêm kiến thức nền hoặc bối cảnh về chủ đề,
-  thì needs_external_context = true.
-- Chỉ finalize khi đã đủ dữ liệu để trả lời tốt.
+[GOAL]
+Chọn chính xác 1 action tiếp theo để hoàn thành yêu cầu người dùng.
 
-Action hợp lệ:
-1. extract_transcript
-2. detect_topic
-3. search_topic_in_transcript
-4. lookup_wikipedia
-5. save_to_database
-6. finalize
+[WORKING MODE]
+Bạn phải suy luận theo mô hình ReAct:
+Reason → Act → Observe → lặp lại
 
-Trạng thái hiện tại:
+Bạn KHÔNG được trả lời trực tiếp.
+Bạn CHỈ chọn action tiếp theo.
+
+---
+
+[AVAILABLE ACTIONS]
+- extract_transcript
+- detect_topic
+- search_topic_in_transcript
+- lookup_wikipedia
+- finalize
+
+(Lưu ý: save_to_database KHÔNG được dùng trong vòng lặp planner)
+
+---
+
+[CURRENT STATE]
 - has_transcript: {bool(self.state.transcript)}
 - detected_topic: {json.dumps(self.state.detected_topic, ensure_ascii=False)}
 - topic_result: {json.dumps(self.state.topic_result, ensure_ascii=False)}
 - has_external_context: {bool(self.state.external_context)}
 - recent_observations: {json.dumps(self.state.observations[-6:], ensure_ascii=False)}
 
-Quy tắc hợp lệ:
-- Nếu chưa có transcript thì không thể search topic.
-- Nếu chưa có topic thì không thể lookup theo topic.
-- save_to_database không thực hiện trong loop, chỉ sau khi có kết quả cuối.
-- Nếu topic đã được tìm thấy trong transcript và người dùng muốn biết thêm, nên lookup_wikipedia trước khi finalize.
+---
 
-Trả đúng JSON:
+[DECISION LOGIC - BẮT BUỘC TUÂN THỦ]
+
+1. Nếu chưa có transcript:
+   → PHẢI chọn extract_transcript
+
+2. Nếu đã có transcript nhưng chưa có topic:
+   → PHẢI chọn detect_topic
+
+3. Nếu có topic nhưng chưa search:
+   → PHẢI chọn search_topic_in_transcript
+
+4. Nếu topic đã tìm thấy:
+   - Nếu user cần hiểu sâu / thêm kiến thức:
+     → chọn lookup_wikipedia
+   - Nếu không:
+     → finalize
+
+5. Nếu topic không tìm thấy:
+   - Có thể lookup_wikipedia nếu user cần
+   - hoặc finalize
+
+6. Chỉ finalize khi:
+   - đã có transcript
+   - đã xử lý đủ yêu cầu user
+
+---
+
+[EXTERNAL CONTEXT RULE]
+Nếu user yêu cầu:
+- hiểu sâu hơn
+- giải thích thêm
+- kiến thức nền
+- ví dụ mở rộng
+
+→ needs_external_context = true  
+→ ưu tiên lookup_wikipedia trước finalize
+
+---
+
+[CONSTRAINTS]
+- KHÔNG chọn action không hợp lệ
+- KHÔNG bỏ qua bước bắt buộc
+- KHÔNG lặp action vô nghĩa
+- KHÔNG finalize quá sớm
+- KHÔNG gọi save_to_database
+
+---
+
+[OUTPUT FORMAT]
+Chỉ trả JSON hợp lệ:
+
 {{
-  "thought": "một câu ngắn",
-  "action": "extract_transcript | detect_topic | search_topic_in_transcript | lookup_wikipedia | save_to_database | finalize",
+  "thought": "một câu suy nghĩ ngắn",
+  "action": "extract_transcript | detect_topic | search_topic_in_transcript | lookup_wikipedia | finalize",
   "action_input": null,
-  "reason": "vì sao",
+  "reason": "giải thích ngắn gọn",
   "needs_external_context": true hoặc false
 }}
 
-Yêu cầu người dùng:
+---
+
+[USER REQUEST]
 {user_request}
 """
 
@@ -921,29 +1089,54 @@ Yêu cầu người dùng:
         topic_result = agent_output.get("topic_result")
 
         final_prompt = f"""
+[ROLE]
 Bạn là AI hỗ trợ học từ video bài giảng.
 
-Hãy tạo đúng JSON theo schema LearningOutput.
+[GOAL]
+Tạo kết quả học tập hoàn chỉnh dưới dạng JSON đúng theo schema `LearningOutput`.
 
-Yêu cầu:
-- Dựa trên transcript và dữ liệu đã thu thập.
-- Toàn bộ output phải cùng ngôn ngữ với người dùng có mã ISO là: {self.state.user_language}
-- Không bịa nội dung ngoài transcript.
-- Nếu không có chủ đề cụ thể thì `ket_qua_tim_chu_de` là null.
-- `ghi_chu_agent` mô tả ngắn các bước agent đã thực hiện.
-- Nếu có thông tin nền từ Wikipedia thì chỉ dùng như phần bổ sung, không được thay thế nội dung transcript.
-- Nếu transcript không có timestamp chắc chắn thì `moc_thoi_gian` phải là null.
+[PRIMARY DATA SOURCES]
+Bạn chỉ được sử dụng các nguồn dữ liệu sau, theo thứ tự ưu tiên:
+1. Transcript video
+2. Topic result đã được hệ thống phân tích
+3. Agent observations
+4. Thông tin nền từ Wikipedia (chỉ dùng để bổ sung, không được thay thế transcript)
 
-Yêu cầu người dùng:
+[USER LANGUAGE]
+Toàn bộ output phải sử dụng ngôn ngữ có mã ISO: {self.state.user_language}
+
+[STRICT INSTRUCTIONS]
+- Phải trả về đúng 1 JSON hợp lệ theo schema `LearningOutput`.
+- Không được trả thêm giải thích, markdown, tiêu đề hoặc văn bản ngoài JSON.
+- Không được bịa nội dung không có trong transcript.
+- Nếu thông tin không đủ chắc chắn, hãy để trường phù hợp là null hoặc danh sách rỗng thay vì suy đoán.
+- Nếu không có chủ đề cụ thể từ yêu cầu người dùng, `ket_qua_tim_chu_de` phải là null.
+- Nếu transcript không có timestamp chắc chắn, `moc_thoi_gian` phải là null.
+- Nếu có thông tin từ Wikipedia, chỉ dùng như phần mở rộng kiến thức nền trong `thong_tin_mo_rong` hoặc `nguon_wikipedia`.
+- Không được dùng thông tin từ Wikipedia để thay thế nội dung chính của transcript.
+- `ghi_chu_agent` phải mô tả ngắn gọn các bước chính mà agent đã thực hiện.
+
+[FIELD REQUIREMENTS]
+- `chu_de`: nêu chủ đề chính của bài giảng.
+- `tom_tat`: là danh sách 3 đến 8 ý tóm tắt ngắn, rõ ràng, bám sát transcript.
+- `y_chinh`: là danh sách 3 đến 8 ý chính quan trọng nhất của bài giảng.
+- `cau_hoi_trac_nghiem`: tạo từ 1 đến 10 câu hỏi trắc nghiệm, mỗi câu gồm:
+  - `cau_hoi`
+  - `lua_chon` với đúng 4 đáp án A, B, C, D
+  - `dap_an_dung` chỉ được là A, B, C hoặc D
+- `ket_qua_tim_chu_de`: chỉ điền khi người dùng có yêu cầu tìm chủ đề cụ thể.
+- `ghi_chu_agent`: tóm tắt ngắn gọn pipeline agent đã chạy.
+
+[USER REQUEST]
 {user_request}
 
-Transcript:
+[TRANSCRIPT]
 {(self.state.transcript or "")[:8000]}
 
-Topic result:
+[TOPIC RESULT]
 {json.dumps(topic_result, ensure_ascii=False) if topic_result else "null"}
 
-Agent observations:
+[AGENT OBSERVATIONS]
 {json.dumps(self.state.observations, ensure_ascii=False)}
 """
 
