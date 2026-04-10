@@ -63,6 +63,7 @@ class AgentState:
 
     observations: list[str] = field(default_factory=list)
     logs: list[str] = field(default_factory=list)
+    workflow_logs: list[dict] = field(default_factory=list)
 
 
 # =========================
@@ -73,9 +74,6 @@ class GeminiVideoAgent:
         self.client = genai.Client(api_key=api_key)
         self.model = model
 
-        # 2-model routing để giảm rủi ro 502/503:
-        # - model chính: tác vụ cần reasoning / output cuối
-        # - flash-lite: planner + task nhẹ + fallback
         self.primary_model = model
         self.fallback_model = "gemini-2.5-flash-lite"
 
@@ -101,6 +99,112 @@ class GeminiVideoAgent:
             "search_topic_in_transcript": self.tool_search_topic,
             "lookup_wikipedia": self.tool_lookup_wikipedia,
             "save_to_database": self.tool_save,
+        }
+        
+    def _log(self, message: str):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_line = f"[{timestamp}] {message}"
+        self.state.logs.append(log_line)
+        print(log_line, flush=True)
+
+    def _json_safe(self, value: Any):
+        try:
+            json.dumps(value, ensure_ascii=False)
+            return value
+        except Exception:
+            if isinstance(value, dict):
+                return {str(k): self._json_safe(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple, set)):
+                return [self._json_safe(v) for v in value]
+            return str(value)
+
+    def _workflow_event(self, event: str, **payload):
+        entry = {
+            "ts": datetime.now(UTC).isoformat(),
+            "event": event,
+            **{k: self._json_safe(v) for k, v in payload.items()},
+        }
+        self.state.workflow_logs.append(entry)
+        try:
+            preview = json.dumps(entry, ensure_ascii=False)
+        except Exception:
+            preview = str(entry)
+        self._log(f"workflow_event={preview[:800]}")
+        return entry
+
+    def _state_snapshot(self) -> dict:
+        return {
+            "has_transcript": bool(self.state.transcript),
+            "transcript_len": len(self.state.transcript or ""),
+            "detected_topic": self.state.detected_topic,
+            "has_topic_result": self.state.topic_result is not None,
+            "has_external_context": bool(self.state.external_context),
+            "observations_count": len(self.state.observations),
+        }
+
+    def _extract_function_calls_from_response(self, response) -> list[Any]:
+        calls = []
+        if response is None:
+            return calls
+
+        direct_calls = getattr(response, "function_calls", None)
+        if direct_calls:
+            return list(direct_calls)
+
+        candidates = getattr(response, "candidates", None) or []
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            if not content:
+                continue
+            for part in getattr(content, "parts", None) or []:
+                function_call = getattr(part, "function_call", None)
+                if function_call:
+                    calls.append(function_call)
+        return calls
+
+    def _execute_function_call(self, function_call: Any, user_request: str) -> dict:
+        fn_name = getattr(function_call, "name", None)
+        fn_args = dict(getattr(function_call, "args", None) or {})
+        call_id = getattr(function_call, "id", None)
+
+        self._workflow_event(
+            "tool_call_requested",
+            tool_name=fn_name,
+            call_id=call_id,
+            args=fn_args,
+            state=self._state_snapshot(),
+        )
+
+        if fn_name == "fc_extract_transcript":
+            result = self.fc_extract_transcript()
+        elif fn_name == "fc_detect_topic":
+            if not fn_args.get("user_request"):
+                fn_args["user_request"] = user_request
+            result = self.fc_detect_topic(**fn_args)
+        elif fn_name == "fc_search_topic_in_transcript":
+            if not fn_args.get("topic"):
+                fn_args["topic"] = self.state.detected_topic or ""
+            result = self.fc_search_topic_in_transcript(**fn_args)
+        elif fn_name == "fc_lookup_wikipedia":
+            if not fn_args.get("query"):
+                fn_args["query"] = self.state.detected_topic or ""
+            result = self.fc_lookup_wikipedia(**fn_args)
+        elif fn_name == "fc_finalize_research":
+            result = self.fc_finalize_research()
+        else:
+            raise RuntimeError(f"Unknown function call: {fn_name}")
+
+        self._workflow_event(
+            "tool_call_result",
+            tool_name=fn_name,
+            call_id=call_id,
+            result=result,
+            state=self._state_snapshot(),
+        )
+        return {
+            "id": call_id,
+            "name": fn_name,
+            "response": result,
         }
 
     # =========================
@@ -132,7 +236,7 @@ class GeminiVideoAgent:
         for chosen_model in fallback_chain:
             for attempt in range(max_retries_per_model):
                 try:
-                    self.state.logs.append(
+                    self._log(
                         f"model_call model={chosen_model} attempt={attempt+1}/{max_retries_per_model}"
                     )
                     return self.client.models.generate_content(
@@ -143,10 +247,10 @@ class GeminiVideoAgent:
                 except Exception as e:
                     last_exc = e
                     err_text = str(e).upper()
-                    self.state.logs.append(f"model_error model={chosen_model} err={e}")
+                    self._log(f"model_error model={chosen_model} err={e}")
 
                     if "404" in err_text or "NOT_FOUND" in err_text:
-                        self.state.logs.append(f"skip_unavailable_model={chosen_model}")
+                        self._log(f"skip_unavailable_model={chosen_model}")
                         break
 
                     if not self._is_retryable_error(e):
@@ -154,10 +258,10 @@ class GeminiVideoAgent:
 
                     if attempt < max_retries_per_model - 1:
                         delay = min(10, 1.5 * (2 ** attempt)) + random.uniform(0, 0.5)
-                        self.state.logs.append(f"retry_sleep={delay:.2f}s")
+                        self._log(f"retry_sleep={delay:.2f}s")
                         time.sleep(delay)
 
-            self.state.logs.append(f"switch_model_from={chosen_model}")
+            self._log(f"switch_model_from={chosen_model}")
 
         raise RuntimeError(
             f"Model failed after retries across fallbacks: {last_exc}"
@@ -166,6 +270,225 @@ class GeminiVideoAgent:
     # =========================
     # HELPERS
     # =========================
+    def _chunk_transcript(self, text: str, chunk_size: int = 4000, overlap: int = 500) -> list[str]:
+        """
+        Chia transcript dài thành nhiều đoạn có overlap để tránh mất ngữ cảnh.
+        chunk_size và overlap đang tính theo số ký tự để đơn giản và ổn định.
+        """
+        text = (text or "").strip()
+        if not text:
+            return []
+
+        chunks: list[str] = []
+        start = 0
+        n = len(text)
+
+        while start < n:
+            end = min(start + chunk_size, n)
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+
+            if end >= n:
+                break
+
+            start = max(0, end - overlap)
+
+        self._log(f"chunk_transcript total_chars={n} chunks={len(chunks)}")
+        return chunks
+
+    def _summarize_chunk(self, chunk_text: str, chunk_index: int) -> dict:
+        """
+        Tóm tắt một chunk transcript.
+        Trả về JSON gồm tom_tat và y_chinh.
+        """
+        prompt = f"""
+[ROLE]
+Bạn là AI hỗ trợ tóm tắt một đoạn transcript của video bài giảng.
+
+[GOAL]
+Tạo bản tóm tắt ngắn gọn và trích xuất ý chính từ đoạn transcript này.
+
+[INSTRUCTIONS]
+- Chỉ dựa trên nội dung transcript được cung cấp.
+- Không bịa thêm thông tin ngoài transcript.
+- Tóm tắt ngắn gọn, rõ ràng, dễ hiểu.
+- Rút ra các ý chính quan trọng nhất của đoạn này.
+- Nếu transcript chỉ là một phần của video dài, chỉ tóm tắt đúng phần này.
+
+[CONSTRAINTS]
+- Không trả lời ngoài phạm vi transcript.
+- Không thêm markdown.
+- Chỉ trả JSON hợp lệ.
+
+[OUTPUT FORMAT]
+{{
+  "tom_tat": ["ý tóm tắt 1", "ý tóm tắt 2", "ý tóm tắt 3"],
+  "y_chinh": ["ý chính 1", "ý chính 2", "ý chính 3"]
+}}
+
+[CHUNK INDEX]
+{chunk_index}
+
+[TRANSCRIPT CHUNK]
+{chunk_text}
+"""
+        res = self._generate_with_retry(
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            ),
+            model_name=self.task_models["final"],
+        )
+
+        data = self._safe_json_load(
+            getattr(res, "text", "") or "",
+            {"tom_tat": [], "y_chinh": []},
+        )
+
+        if not isinstance(data, dict):
+            data = {"tom_tat": [], "y_chinh": []}
+
+        if not isinstance(data.get("tom_tat"), list):
+            data["tom_tat"] = []
+        if not isinstance(data.get("y_chinh"), list):
+            data["y_chinh"] = []
+
+        self._log(
+            f"summarize_chunk index={chunk_index} summary_items={len(data['tom_tat'])} keypoints={len(data['y_chinh'])}"
+        )
+        return data
+
+    def _summarize_long_transcript(self) -> dict:
+        """
+        Xử lý transcript dài theo kiểu:
+        1) chia đoạn
+        2) tóm tắt từng đoạn
+        3) gộp và tổng hợp thành summary cuối
+        """
+        transcript = self.state.transcript or ""
+        if not transcript.strip():
+            return {"tom_tat": [], "y_chinh": []}
+
+        chunks = self._chunk_transcript(transcript)
+        if not chunks:
+            return {"tom_tat": [], "y_chinh": []}
+
+        # Nếu transcript ngắn thì không cần map-reduce quá nhiều
+        if len(chunks) == 1:
+            return self._summarize_chunk(chunks[0], 1)
+
+        chunk_summaries: list[dict] = []
+        for idx, chunk in enumerate(chunks, start=1):
+            chunk_summaries.append(self._summarize_chunk(chunk, idx))
+
+        combined_summaries: list[str] = []
+        combined_keypoints: list[str] = []
+
+        for item in chunk_summaries:
+            combined_summaries.extend(
+                [x for x in item.get("tom_tat", []) if isinstance(x, str) and x.strip()]
+            )
+            combined_keypoints.extend(
+                [x for x in item.get("y_chinh", []) if isinstance(x, str) and x.strip()]
+            )
+
+        # Khử trùng lặp giữ nguyên thứ tự
+        combined_summaries = list(dict.fromkeys(combined_summaries))
+        combined_keypoints = list(dict.fromkeys(combined_keypoints))
+
+        reduce_prompt = f"""
+[ROLE]
+Bạn là AI tổng hợp nội dung từ nhiều bản tóm tắt trung gian của transcript video bài giảng.
+
+[GOAL]
+Tạo ra bản tóm tắt cuối cùng phản ánh đầy đủ toàn bộ video, không chỉ phần đầu transcript.
+
+[INSTRUCTIONS]
+- Dựa trên các tóm tắt trung gian và các ý chính trung gian.
+- Phải bao phủ các giai đoạn/nội dung quan trọng trên toàn bộ video.
+- Không chỉ tập trung vào phần đầu.
+- Loại bỏ các ý trùng lặp.
+- Giữ lại các ý có giá trị thông tin cao nhất.
+- Không bịa thêm thông tin ngoài dữ liệu đã cho.
+
+[CONSTRAINTS]
+- Chỉ trả JSON hợp lệ.
+- Không thêm markdown hay giải thích.
+
+[OUTPUT FORMAT]
+{{
+  "tom_tat": ["ý tóm tắt 1", "ý tóm tắt 2", "ý tóm tắt 3", "ý tóm tắt 4", "ý tóm tắt 5"],
+  "y_chinh": ["ý chính 1", "ý chính 2", "ý chính 3", "ý chính 4", "ý chính 5"]
+}}
+
+[TÓM TẮT TRUNG GIAN]
+{json.dumps(combined_summaries, ensure_ascii=False)}
+
+[Ý CHÍNH TRUNG GIAN]
+{json.dumps(combined_keypoints, ensure_ascii=False)}
+"""
+        res = self._generate_with_retry(
+            contents=reduce_prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            ),
+            model_name=self.task_models["final"],
+        )
+
+        final_data = self._safe_json_load(
+            getattr(res, "text", "") or "",
+            {"tom_tat": [], "y_chinh": []},
+        )
+
+        if not isinstance(final_data, dict):
+            final_data = {"tom_tat": [], "y_chinh": []}
+
+        if not isinstance(final_data.get("tom_tat"), list):
+            final_data["tom_tat"] = combined_summaries[:5]
+        if not isinstance(final_data.get("y_chinh"), list):
+            final_data["y_chinh"] = combined_keypoints[:5]
+
+        self._log(
+            f"summarize_long_transcript final_summary_items={len(final_data['tom_tat'])} final_keypoints={len(final_data['y_chinh'])}"
+        )
+        return final_data
+
+    def _build_transcript_context_for_final(self, transcript: str, chunk_size: int = 12000) -> str:
+        """
+        Tạo context transcript cho prompt cuối mà hạn chế thất thoát thông tin.
+
+        - Transcript ngắn/vừa: đưa toàn bộ vào prompt cuối.
+        - Transcript rất dài: giữ nhiều cửa sổ (đầu/giữa/cuối) thay vì chỉ lấy 20k ký tự đầu.
+        """
+        transcript = (transcript or "").strip()
+        if not transcript:
+            return ""
+
+        if len(transcript) <= 120000:
+            self._log(f"final_context_mode=full chars={len(transcript)}")
+            return transcript
+
+        n = len(transcript)
+        windows: list[str] = []
+        anchors = [0, max(0, n // 3 - chunk_size // 2), max(0, (2 * n) // 3 - chunk_size // 2), max(0, n - chunk_size)]
+
+        seen = set()
+        for start in anchors:
+            end = min(start + chunk_size, n)
+            key = (start, end)
+            if key in seen:
+                continue
+            seen.add(key)
+            section = transcript[start:end].strip()
+            if section:
+                windows.append(f"[TRANSCRIPT WINDOW {start}:{end}]\n{section}")
+
+        self._log(
+            f"final_context_mode=windowed chars={len(transcript)} windows={len(windows)} window_size={chunk_size}"
+        )
+        return "\n\n".join(windows)
+    
     def _normalize_user_request(self, user_request: str) -> str:
         return " ".join(user_request.strip().split())
 
@@ -202,9 +525,11 @@ class GeminiVideoAgent:
             return default
 
     def _observe(self, message: str):
-        self.state.observations.append(message[:500])
+        clipped = message[:500]
+        self.state.observations.append(clipped)
         if len(self.state.observations) > 10:
             self.state.observations = self.state.observations[-10:]
+        self._workflow_event("observation", message=clipped, state=self._state_snapshot())
 
     def _clean_wikipedia_snippet(self, text: str) -> str:
         if not text:
@@ -291,13 +616,9 @@ Bạn là hệ thống tạo truy vấn tìm kiếm Wikipedia tiếng Anh.
 [GOAL]
 Sinh ra các truy vấn tìm kiếm tối ưu để tìm đúng bài Wikipedia liên quan đến chủ đề.
 
----
-
 [INPUT]
 Chủ đề:
 {topic}
-
----
 
 [QUERY GENERATION STRATEGY]
 Bạn cần suy luận và tạo các biến thể truy vấn dựa trên:
@@ -308,8 +629,6 @@ Bạn cần suy luận và tạo các biến thể truy vấn dựa trên:
 - tên học thuật hoặc chính thức
 - tên sự kiện hoặc nhân vật liên quan trực tiếp
 - cách viết không dấu hoặc biến thể đơn giản hơn (nếu hữu ích)
-
----
 
 [QUALITY RULES]
 - Mỗi query phải:
@@ -323,8 +642,6 @@ Bạn cần suy luận và tạo các biến thể truy vấn dựa trên:
   - tên nhân vật
   - khái niệm chính xác
 
----
-
 [CONSTRAINTS]
 - KHÔNG tạo query quá chung chung (ví dụ: "history", "lesson")
 - KHÔNG lệch chủ đề
@@ -332,14 +649,10 @@ Bạn cần suy luận và tạo các biến thể truy vấn dựa trên:
 - KHÔNG thêm văn bản ngoài JSON
 - KHÔNG tạo query vô nghĩa hoặc trùng lặp
 
----
-
 [OUTPUT RULES]
 - Trả từ 3 đến 6 queries
 - Mỗi query là một chuỗi ngắn
 - Không lặp lại ý nghĩa
-
----
 
 [OUTPUT FORMAT]
 Chỉ trả JSON hợp lệ:
@@ -402,7 +715,7 @@ Chỉ trả JSON hợp lệ:
             time.sleep(3)
 
     def tool_extract_transcript(self):
-        self.state.logs.append("tool=extract_transcript")
+        self._log("tool=extract_transcript")
 
         if self.state.transcript:
             return self.state.transcript
@@ -420,33 +733,33 @@ Trích xuất transcript từ video một cách trung thực, đầy đủ và b
 
 [INSTRUCTIONS]
 
-* Chuyển toàn bộ lời nói trong video thành văn bản.
-* Giữ nguyên ngôn ngữ gốc được nói trong video.
-* Nếu có thể xác định được mốc thời gian, hãy đặt timestamp gần đúng theo định dạng [MM:SS] ở đầu câu hoặc đoạn.
-* Nếu một đoạn không nghe rõ, ghi [không rõ].
-* Giữ nội dung theo đúng thứ tự xuất hiện trong video.
+- Chuyển toàn bộ lời nói trong video thành văn bản.
+- Giữ nguyên ngôn ngữ gốc được nói trong video.
+- Nếu có thể xác định được mốc thời gian, hãy đặt timestamp gần đúng theo định dạng [MM:SS] ở đầu câu hoặc đoạn.
+- Nếu một đoạn không nghe rõ, ghi [không rõ].
+- Giữ nội dung theo đúng thứ tự xuất hiện trong video.
 
 [TRANSCRIPT RULES]
 
-* Transcript phải bám sát lời nói thực tế trong video.
-* Không được rút gọn ý.
-* Không được diễn giải lại theo cách khác.
-* Không được thêm thông tin không xuất hiện trong audio.
-* Không được sửa nội dung theo suy đoán.
+- Transcript phải bám sát lời nói thực tế trong video.
+- Không được rút gọn ý.
+- Không được diễn giải lại theo cách khác.
+- Không được thêm thông tin không xuất hiện trong audio.
+- Không được sửa nội dung theo suy đoán.
 
 [TIMESTAMP RULES]
 
-* Chỉ thêm timestamp khi có đủ căn cứ từ video.
-* Timestamp phải ở dạng [MM:SS].
-* Nếu không xác định được timestamp ở một đoạn, bỏ qua timestamp cho đoạn đó.
-* Không được bịa timestamp.
+- Chỉ thêm timestamp khi có đủ căn cứ từ video.
+- Timestamp phải ở dạng [MM:SS].
+- Nếu không xác định được timestamp ở một đoạn, bỏ qua timestamp cho đoạn đó.
+- Không được bịa timestamp.
 
 [CONSTRAINTS]
 
-* Không tóm tắt.
-* Không phân tích.
-* Không nhận xét.
-* Không trả thêm giải thích.
+- Không tóm tắt.
+- Không phân tích.
+- Không nhận xét.
+- Không trả thêm giải thích.
 
 [OUTPUT FORMAT]
 Chỉ trả về transcript thuần.
@@ -479,7 +792,13 @@ Nội dung tiếp theo...
                 model_name=self.task_models["default"],
             )
 
-        self.state.transcript = (res.text or "").strip()[:15000]
+        full_text = (res.text or "").strip()
+
+        # lưu bản full
+        self.state.raw_transcript = full_text
+
+        # dùng transcript làm việc (có thể chunk sau)
+        self.state.transcript = full_text
         self._observe(f"Đã có transcript, độ dài {len(self.state.transcript)} ký tự.")
         return self.state.transcript
 
@@ -487,23 +806,50 @@ Nội dung tiếp theo...
     # CORE TOOLS
     # =========================
     def tool_detect_topic(self, user_request: str) -> Optional[str]:
-        self.state.logs.append("tool=detect_topic")
+        self._log("tool=detect_topic")
 
         prompt = f"""
-Trích xuất chủ đề cụ thể mà người dùng muốn kiểm tra trong video.
+[ROLE]
+Bạn là hệ thống phân tích yêu cầu người dùng.
 
-Trả JSON:
+[GOAL]
+Trích xuất chủ đề cụ thể mà người dùng muốn kiểm tra trong video bài giảng.
+
+[INPUT]
+Yêu cầu người dùng:
+{user_request}
+
+[INSTRUCTIONS]
+- Phân tích yêu cầu người dùng.
+- Nếu người dùng hỏi về một chủ đề cụ thể → trích xuất chủ đề đó.
+- Chủ đề có thể là:
+  - một khái niệm
+  - một sự kiện
+  - một nhân vật
+  - một nội dung cụ thể trong bài giảng
+
+[DECISION RULE]
+- Nếu yêu cầu rõ ràng → trả chủ đề.
+- Nếu yêu cầu chung chung (ví dụ: "tóm tắt video", "nội dung chính là gì") → trả null.
+- Nếu không chắc chắn → ưu tiên trả null.
+
+[CONSTRAINTS]
+- KHÔNG giải thích.
+- KHÔNG thêm văn bản ngoài JSON.
+- KHÔNG suy diễn quá mức từ yêu cầu người dùng.
+
+[OUTPUT FORMAT]
+Chỉ trả JSON hợp lệ:
+
 {{
   "topic": "..."
 }}
 
-Nếu không có chủ đề cụ thể, trả:
+Hoặc:
+
 {{
   "topic": null
 }}
-
-Yêu cầu người dùng:
-{user_request}
 """
 
         res = self._generate_with_retry(
@@ -524,88 +870,35 @@ Yêu cầu người dùng:
         return self.state.detected_topic
 
     def tool_search_topic(self, topic: str) -> dict:
-        self.state.logs.append(f"tool=search_topic topic={topic}")
+        self._log(f"tool=search_topic topic={topic}")
 
-        text = self.state.transcript or ""
-        if not text.strip():
-            result = {
-                "chu_de": topic,
-                "co_tim_thay": False,
-                "moc_thoi_gian": None,
-                "doan_lien_quan": None,
-                "thong_tin_mo_rong": [],
-                "nguon_wikipedia": [],
-            }
-            self.state.topic_result = result
-            return result
+        transcript_source = getattr(self.state, "raw_transcript", None) or self.state.transcript or ""
+        self._log(
+            f"search_topic_source={'raw_transcript' if getattr(self.state, 'raw_transcript', None) else 'transcript'} chars={len(transcript_source)}"
+        )
 
-        prompt = f"""
-[ROLE]
-Bạn là hệ thống phân tích ngữ nghĩa transcript video bài giảng.
+        chunks = self._chunk_transcript(transcript_source)
 
-[GOAL]
-Xác định liệu transcript có đề cập đến chủ đề người dùng hỏi hay không.
+        matches: list[dict] = []
 
----
+        for index, chunk in enumerate(chunks, start=1):
+            prompt = f"""
+    [GOAL]
+    Tìm xem đoạn transcript này có chứa topic không
 
-[INPUT]
-Chủ đề cần kiểm tra:
-{topic}
+    [TOPIC]
+    {topic}
 
-Transcript:
-{text[:10000]}
+    [TRANSCRIPT]
+    {chunk}
 
----
-
-[SEMANTIC MATCHING RULE]
-- Không yêu cầu trùng từ khóa chính xác.
-- Được phép suy luận theo NGHĨA.
-- Nếu nội dung có cùng bản chất, sự kiện, nhân vật hoặc khái niệm → coi là liên quan.
-
-Ví dụ:
-- Topic: "cuộc khởi nghĩa Hai Bà Trưng"
-- Transcript: "Hai Bà Trưng nổi dậy chống nhà Hán"
-→ Vẫn coi là có liên quan
-
----
-
-[DECISION RULE]
-- Nếu tìm thấy nội dung liên quan rõ ràng → co_tim_thay = true
-- Nếu không có hoặc không đủ chắc chắn → co_tim_thay = false
-- Nếu phân vân → ưu tiên false (tránh suy đoán sai)
-
----
-
-[TIMESTAMP RULE]
-- Chỉ trả `moc_thoi_gian` nếu:
-  - transcript có timestamp dạng [MM:SS]
-  - và đoạn liên quan nằm gần timestamp đó
-- Nếu không có timestamp rõ ràng → moc_thoi_gian = null
-- KHÔNG được tự suy đoán timestamp
-
----
-
-[CONSTRAINTS]
-- CHỈ sử dụng thông tin từ transcript
-- KHÔNG dùng kiến thức bên ngoài
-- KHÔNG suy diễn vượt quá nội dung transcript
-- KHÔNG bịa nội dung
-- KHÔNG trả thêm giải thích
-
----
-
-[OUTPUT FORMAT]
-Chỉ trả JSON hợp lệ:
-
-{{
-  "chu_de": "{topic}",
-  "co_tim_thay": true hoặc false,
-  "moc_thoi_gian": "MM:SS" hoặc null,
-  "doan_lien_quan": "trích đoạn ngắn liên quan" hoặc null
-}}
-"""
-
-        try:
+    [OUTPUT JSON]
+    {{
+    "co_tim_thay": true hoặc false,
+    "doan_lien_quan": "...",
+    "moc_thoi_gian": null hoặc "MM:SS"
+    }}
+    """
             res = self._generate_with_retry(
                 contents=prompt,
                 config=types.GenerateContentConfig(
@@ -614,50 +907,51 @@ Chỉ trả JSON hợp lệ:
                 model_name=self.task_models["semantic_search"],
             )
 
-            data = self._safe_json_load(
-                res.text,
-                {
-                    "chu_de": topic,
-                    "co_tim_thay": False,
-                    "moc_thoi_gian": None,
-                    "doan_lien_quan": None,
-                },
-            )
+            data = self._safe_json_load(res.text, {})
 
-            result = {
-                "chu_de": data.get("chu_de", topic),
-                "co_tim_thay": bool(data.get("co_tim_thay", False)),
-                "moc_thoi_gian": data.get("moc_thoi_gian"),
-                "doan_lien_quan": data.get("doan_lien_quan"),
-                "thong_tin_mo_rong": [],
-                "nguon_wikipedia": [],
-            }
+            if data.get("co_tim_thay"):
+                data["chunk_index"] = index
+                matches.append(data)
 
-        except Exception as e:
-            self.state.logs.append(f"search_topic_semantic_error={e}")
-            result = {
-                "chu_de": topic,
-                "co_tim_thay": False,
-                "moc_thoi_gian": None,
-                "doan_lien_quan": None,
-                "thong_tin_mo_rong": [],
-                "nguon_wikipedia": [],
-            }
+        relevant_passages = []
+        timestamps = []
+        for item in matches:
+            passage = item.get("doan_lien_quan")
+            timestamp = item.get("moc_thoi_gian")
+            if isinstance(passage, str) and passage.strip():
+                relevant_passages.append(passage.strip())
+            if isinstance(timestamp, str) and timestamp.strip():
+                timestamps.append(timestamp.strip())
+
+        relevant_passages = list(dict.fromkeys(relevant_passages))
+        timestamps = list(dict.fromkeys(timestamps))
+
+        result = {
+            "chu_de": topic,
+            "co_tim_thay": bool(matches),
+            "moc_thoi_gian": timestamps[0] if timestamps else None,
+            "cac_moc_thoi_gian": timestamps,
+            "doan_lien_quan": "\n\n".join(relevant_passages[:5]) if relevant_passages else None,
+            "so_lan_xuat_hien": len(matches),
+            "thong_tin_mo_rong": [],
+            "nguon_wikipedia": [],
+        }
+
+        self._log(
+            f"search_topic matches={len(matches)} timestamps={len(timestamps)} passages={len(relevant_passages)}"
+        )
 
         self.state.topic_result = result
-        self._observe(
-            f"Kết quả search topic semantic: found={result['co_tim_thay']} timestamp={result.get('moc_thoi_gian')}"
-        )
         return result
 
     def tool_lookup_wikipedia(self, query: str) -> list[dict]:
-        self.state.logs.append(f"tool=lookup_wikipedia query={query}")
+        self._log(f"tool=lookup_wikipedia query={query}")
 
         search_url = "https://en.wikipedia.org/w/api.php"
         cleaned: list[dict] = []
         seen_titles: set[str] = set()
         search_queries = self._generate_wikipedia_queries(query)
-        self.state.logs.append(f"wiki_queries={search_queries}")
+        self._log(f"wiki_queries={search_queries}")
 
         for search_query in search_queries:
             params = {
@@ -713,7 +1007,7 @@ Chỉ trả JSON hợp lệ:
         return cleaned
 
     def tool_save(self, data):
-        self.state.logs.append("tool=save_db")
+        self._log("tool=save_db")
 
         mongo_uri = os.getenv("MONGO_URI")
         db_name = os.getenv("MONGO_DB")
@@ -749,11 +1043,215 @@ Chỉ trả JSON hợp lệ:
                 "message": str(e),
             }
 
+
+    # =========================
+    # GEMINI TOOL CALLING
+    # =========================
+    def fc_extract_transcript(self) -> dict:
+        """Extract the full raw transcript from the current video.
+
+        Use this first when transcript is missing. This tool reads the video/audio and stores
+        the complete raw transcript in agent state for later topic search and final learning output.
+        """
+        transcript = self.tool_extract_transcript()
+        raw_transcript = getattr(self.state, "raw_transcript", transcript) or ""
+        return {
+            "success": True,
+            "transcript_length": len(raw_transcript),
+            "preview": raw_transcript[:600],
+        }
+
+    def fc_detect_topic(self, user_request: str) -> dict:
+        """Detect the specific topic the user wants to check inside the video.
+
+        Call this after transcript exists. Input must be the original normalized user request.
+        Returns the extracted topic or null when the request is generic.
+        """
+        topic = self.tool_detect_topic(user_request)
+        return {
+            "success": True,
+            "topic": topic,
+        }
+
+    def fc_search_topic_in_transcript(self, topic: str) -> dict:
+        """Search the detected topic in the raw transcript.
+
+        Always search in the raw transcript, not the summary. Use this only after a non-empty
+        topic has been detected.
+        """
+        result = self.tool_search_topic(topic)
+        return {
+            "success": True,
+            "result": result,
+        }
+
+    def fc_lookup_wikipedia(self, query: str) -> dict:
+        """Look up background knowledge on Wikipedia for a topic already found in the transcript.
+
+        Use this only when the user asks for extra explanation, context, background knowledge,
+        or deeper understanding beyond the raw transcript.
+        """
+        results = self.tool_lookup_wikipedia(query)
+        return {
+            "success": True,
+            "results": results,
+        }
+
+    def fc_finalize_research(self) -> dict:
+        """Finalize the tool-calling phase when enough information has been collected.
+
+        Call this only after the required transcript/topic/background steps are complete.
+        """
+        return {
+            "success": True,
+            "has_transcript": bool(self.state.transcript),
+            "detected_topic": self.state.detected_topic,
+            "has_topic_result": self.state.topic_result is not None,
+            "has_external_context": bool(self.state.external_context),
+        }
+
+    def _run_agent_loop_with_gemini_tool_calling(self, user_request: str):
+        self._log("agent_mode=gemini_function_calling_manual")
+        self._workflow_event(
+            "agent_loop_started",
+            mode="manual_function_calling",
+            user_request=user_request,
+            state=self._state_snapshot(),
+        )
+
+        needs_external = self._infer_external_need_fallback(user_request, self.state.detected_topic)
+
+        orchestration_prompt = f"""
+[ROLE]
+Bạn là autonomous agent phân tích video bài giảng bằng Gemini function calling.
+
+[GOAL]
+Hoàn thành việc thu thập dữ liệu cần thiết trước khi hệ thống tạo LearningOutput JSON ở bước sau.
+
+[IMPORTANT]
+- Đây là pha tool-calling, KHÔNG phải pha trả lời cuối.
+- Bạn phải ưu tiên gọi tool thay vì tự suy đoán.
+- Nếu chưa có transcript thì phải gọi fc_extract_transcript.
+- Nếu đã có transcript nhưng chưa có topic thì phải gọi fc_detect_topic với nguyên user request.
+- Nếu có topic nhưng chưa search trong transcript thì phải gọi fc_search_topic_in_transcript.
+- Chỉ gọi fc_lookup_wikipedia khi user thực sự cần kiến thức nền / giải thích thêm.
+- Khi đã đủ dữ liệu, hãy gọi fc_finalize_research.
+- Sau khi gọi fc_finalize_research, chỉ trả lời ngắn: READY.
+
+[AVAILABLE TOOLS]
+- fc_extract_transcript
+- fc_detect_topic
+- fc_search_topic_in_transcript
+- fc_lookup_wikipedia
+- fc_finalize_research
+
+[STATE SNAPSHOT]
+- has_transcript: {bool(self.state.transcript)}
+- detected_topic: {json.dumps(self.state.detected_topic, ensure_ascii=False)}
+- has_topic_result: {self.state.topic_result is not None}
+- has_external_context: {bool(self.state.external_context)}
+- needs_external_context: {needs_external}
+- recent_observations: {json.dumps(self.state.observations[-6:], ensure_ascii=False)}
+
+[USER REQUEST]
+{user_request}
+"""
+
+        contents = [types.Content(role="user", parts=[types.Part(text=orchestration_prompt)])]
+        config = types.GenerateContentConfig(
+            tools=[
+                self.fc_extract_transcript,
+                self.fc_detect_topic,
+                self.fc_search_topic_in_transcript,
+                self.fc_lookup_wikipedia,
+                self.fc_finalize_research,
+            ],
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        )
+
+        max_tool_rounds = 8
+        last_response = None
+
+        for round_index in range(1, max_tool_rounds + 1):
+            self._workflow_event(
+                "model_turn_started",
+                round_index=round_index,
+                state=self._state_snapshot(),
+            )
+            response = self._generate_with_retry(
+                contents=contents,
+                config=config,
+                model_name=self.task_models["planner"],
+            )
+            last_response = response
+            response_text = (getattr(response, "text", "") or "").strip()
+            function_calls = self._extract_function_calls_from_response(response)
+
+            self._workflow_event(
+                "model_turn_completed",
+                round_index=round_index,
+                response_text=response_text[:2000],
+                function_calls=[
+                    {
+                        "id": getattr(fc, "id", None),
+                        "name": getattr(fc, "name", None),
+                        "args": dict(getattr(fc, "args", None) or {}),
+                    }
+                    for fc in function_calls
+                ],
+                state=self._state_snapshot(),
+            )
+
+            if not function_calls:
+                self._workflow_event(
+                    "agent_loop_stopped_no_function_call",
+                    round_index=round_index,
+                    response_text=response_text[:2000],
+                    state=self._state_snapshot(),
+                )
+                break
+
+            contents.append(response.candidates[0].content)
+
+            saw_finalize = False
+            function_response_parts = []
+            for function_call in function_calls:
+                execution = self._execute_function_call(function_call, user_request=user_request)
+                function_response_parts.append(
+                    types.Part.from_function_response(
+                        name=execution["name"],
+                        response={"result": execution["response"]},
+                    )
+                )
+                if execution["name"] == "fc_finalize_research":
+                    saw_finalize = True
+
+            contents.append(types.Content(role="user", parts=function_response_parts))
+
+            if saw_finalize:
+                self._workflow_event(
+                    "agent_loop_finalize_requested",
+                    round_index=round_index,
+                    state=self._state_snapshot(),
+                )
+                break
+
+        self._workflow_event(
+            "agent_loop_finished",
+            final_text=(getattr(last_response, "text", "") or "").strip()[:2000] if last_response else "",
+            state=self._state_snapshot(),
+        )
+        return {
+            "topic_result": self.state.topic_result,
+            "external_context": self.state.external_context,
+            "workflow_logs": self.state.workflow_logs,
+        }
+
     # =========================
     # REACT PLANNER
     # =========================
     def tool_plan_next_action(self, user_request: str) -> AgentAction:
-        self.state.logs.append("tool=planner")
+        self._log("tool=planner")
 
         prompt = f"""
 [ROLE]
@@ -769,8 +1267,6 @@ Reason → Act → Observe → lặp lại
 Bạn KHÔNG được trả lời trực tiếp.
 Bạn CHỈ chọn action tiếp theo.
 
----
-
 [AVAILABLE ACTIONS]
 - extract_transcript
 - detect_topic
@@ -780,16 +1276,12 @@ Bạn CHỈ chọn action tiếp theo.
 
 (Lưu ý: save_to_database KHÔNG được dùng trong vòng lặp planner)
 
----
-
 [CURRENT STATE]
 - has_transcript: {bool(self.state.transcript)}
 - detected_topic: {json.dumps(self.state.detected_topic, ensure_ascii=False)}
 - topic_result: {json.dumps(self.state.topic_result, ensure_ascii=False)}
 - has_external_context: {bool(self.state.external_context)}
 - recent_observations: {json.dumps(self.state.observations[-6:], ensure_ascii=False)}
-
----
 
 [DECISION LOGIC - BẮT BUỘC TUÂN THỦ]
 
@@ -816,8 +1308,6 @@ Bạn CHỈ chọn action tiếp theo.
    - đã có transcript
    - đã xử lý đủ yêu cầu user
 
----
-
 [EXTERNAL CONTEXT RULE]
 Nếu user yêu cầu:
 - hiểu sâu hơn
@@ -828,16 +1318,12 @@ Nếu user yêu cầu:
 → needs_external_context = true  
 → ưu tiên lookup_wikipedia trước finalize
 
----
-
 [CONSTRAINTS]
 - KHÔNG chọn action không hợp lệ
 - KHÔNG bỏ qua bước bắt buộc
 - KHÔNG lặp action vô nghĩa
 - KHÔNG finalize quá sớm
 - KHÔNG gọi save_to_database
-
----
 
 [OUTPUT FORMAT]
 Chỉ trả JSON hợp lệ:
@@ -849,8 +1335,6 @@ Chỉ trả JSON hợp lệ:
   "reason": "giải thích ngắn gọn",
   "needs_external_context": true hoặc false
 }}
-
----
 
 [USER REQUEST]
 {user_request}
@@ -982,7 +1466,7 @@ Chỉ trả JSON hợp lệ:
 
             action = self.tool_plan_next_action(user_request)
 
-            self.state.logs.append(
+            self._log(
                 f"step={step} thought={action.thought} action={action.action} input={action.action_input} needs_external={action.needs_external_context}"
             )
 
@@ -1085,8 +1569,12 @@ Chỉ trả JSON hợp lệ:
         self.state.user_language = self._detect_user_language(user_request)
         self._observe(f"Ngôn ngữ người dùng: {self.state.user_language}")
 
-        agent_output = self._run_agent_loop(user_request)
+        agent_output = self._run_agent_loop_with_gemini_tool_calling(user_request)
         topic_result = agent_output.get("topic_result")
+        self._workflow_event("run_post_research", topic_result=topic_result, state=self._state_snapshot())
+
+        long_transcript_summary = self._summarize_long_transcript()
+        transcript_context = self._build_transcript_context_for_final(self.state.transcript or "")
 
         final_prompt = f"""
 [ROLE]
@@ -1098,9 +1586,10 @@ Tạo kết quả học tập hoàn chỉnh dưới dạng JSON đúng theo sche
 [PRIMARY DATA SOURCES]
 Bạn chỉ được sử dụng các nguồn dữ liệu sau, theo thứ tự ưu tiên:
 1. Transcript video
-2. Topic result đã được hệ thống phân tích
-3. Agent observations
-4. Thông tin nền từ Wikipedia (chỉ dùng để bổ sung, không được thay thế transcript)
+2. Long transcript summary đã được tổng hợp từ toàn bộ transcript
+3. Topic result đã được hệ thống phân tích
+4. Agent observations
+5. Thông tin nền từ Wikipedia (chỉ dùng để bổ sung, không được thay thế transcript)
 
 [USER LANGUAGE]
 Toàn bộ output phải sử dụng ngôn ngữ có mã ISO: {self.state.user_language}
@@ -1109,6 +1598,8 @@ Toàn bộ output phải sử dụng ngôn ngữ có mã ISO: {self.state.user_l
 - Phải trả về đúng 1 JSON hợp lệ theo schema `LearningOutput`.
 - Không được trả thêm giải thích, markdown, tiêu đề hoặc văn bản ngoài JSON.
 - Không được bịa nội dung không có trong transcript.
+- Phải bao quát toàn bộ nội dung video, không chỉ phần đầu transcript.
+- Nếu transcript bao gồm nhiều giai đoạn/nhiều phần nội dung, phần `tom_tat` và `y_chinh` phải phản ánh đủ các phần quan trọng trên toàn bộ video.
 - Nếu thông tin không đủ chắc chắn, hãy để trường phù hợp là null hoặc danh sách rỗng thay vì suy đoán.
 - Nếu không có chủ đề cụ thể từ yêu cầu người dùng, `ket_qua_tim_chu_de` phải là null.
 - Nếu transcript không có timestamp chắc chắn, `moc_thoi_gian` phải là null.
@@ -1130,8 +1621,16 @@ Toàn bộ output phải sử dụng ngôn ngữ có mã ISO: {self.state.user_l
 [USER REQUEST]
 {user_request}
 
-[TRANSCRIPT]
-{(self.state.transcript or "")[:8000]}
+[TRANSCRIPT CONTEXT]
+{transcript_context}
+
+[IMPORTANT]
+Transcript context bên dưới được dựng để giảm thất thoát thông tin từ transcript dài.
+Nếu transcript rất dài, context có thể gồm nhiều cửa sổ đại diện (đầu/giữa/cuối) kết hợp với LONG TRANSCRIPT SUMMARY.
+Hãy dùng cả hai nguồn để bao quát toàn bộ video.
+
+[LONG TRANSCRIPT SUMMARY]
+{json.dumps(long_transcript_summary, ensure_ascii=False)}
 
 [TOPIC RESULT]
 {json.dumps(topic_result, ensure_ascii=False) if topic_result else "null"}
@@ -1139,6 +1638,8 @@ Toàn bộ output phải sử dụng ngôn ngữ có mã ISO: {self.state.user_l
 [AGENT OBSERVATIONS]
 {json.dumps(self.state.observations, ensure_ascii=False)}
 """
+
+        self._workflow_event("final_generation_started", state=self._state_snapshot())
 
         res = self._generate_with_retry(
             contents=final_prompt,
@@ -1155,19 +1656,33 @@ Toàn bộ output phải sử dụng ngôn ngữ có mã ISO: {self.state.user_l
         else:
             data = self._safe_json_load(res.text, {})
 
+        if not isinstance(data, dict):
+            data = {}
+
+        self._workflow_event("final_generation_completed", parsed=data, state=self._state_snapshot())
+
+        # Fix trường ket_qua_tim_chu_de có thể là None
         if topic_result:
-            data.setdefault("ket_qua_tim_chu_de", {})
+            existing_topic_result = data.get("ket_qua_tim_chu_de")
+            data["ket_qua_tim_chu_de"] = existing_topic_result if isinstance(existing_topic_result, dict) else {}
+
+            for key, value in topic_result.items():
+                if data["ket_qua_tim_chu_de"].get(key) in [None, "", [], {}] and value not in [None, "", [], {}]:
+                    data["ket_qua_tim_chu_de"][key] = value
+
             if (
                 not data["ket_qua_tim_chu_de"].get("nguon_wikipedia")
                 and topic_result.get("nguon_wikipedia")
             ):
                 data["ket_qua_tim_chu_de"]["nguon_wikipedia"] = topic_result["nguon_wikipedia"]
+
             if (
                 not data["ket_qua_tim_chu_de"].get("thong_tin_mo_rong")
                 and topic_result.get("thong_tin_mo_rong")
             ):
                 data["ket_qua_tim_chu_de"]["thong_tin_mo_rong"] = topic_result["thong_tin_mo_rong"]
 
+        # Nếu model không sinh đủ ghi_chu_agent thì fallback bằng logs
         if not data.get("ghi_chu_agent"):
             data["ghi_chu_agent"] = "; ".join(self.state.logs[-8:])
 
@@ -1179,10 +1694,11 @@ Toàn bộ output phải sử dụng ngôn ngữ có mã ISO: {self.state.user_l
                 reason="post_finalize_save",
             )
             db_status = self._dispatch(save_action, final_data=data)
-            self.state.logs.append(f"db_status={db_status}")
+            self._log(f"db_status={db_status}")
 
         return {
             "result": data,
             "logs": self.state.logs,
+            "workflow_logs": self.state.workflow_logs,
             "db_status": db_status,
         }

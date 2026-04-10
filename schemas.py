@@ -19,7 +19,7 @@ class QuizQuestion(BaseModel):
     )
 
 
-# 🔥 Đổi từ WebSource → WikipediaSource
+# WikipediaSource
 class WikipediaSource(BaseModel):
     title: str = Field(description="Tiêu đề bài viết Wikipedia")
     url: str = Field(description="Đường dẫn đến trang Wikipedia")
