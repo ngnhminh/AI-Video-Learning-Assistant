@@ -1112,13 +1112,16 @@ Hoặc:
 
     def _run_agent_loop_with_gemini_tool_calling(self, user_request: str):
         self._log("agent_mode=gemini_function_calling_manual")
+        
+        #Ghi log
         self._workflow_event(
             "agent_loop_started",
             mode="manual_function_calling",
             user_request=user_request,
             state=self._state_snapshot(),
         )
-
+        
+        #Kiểm tra người dùng có cần kiểm tra thông tin bên ngoài không
         needs_external = self._infer_external_need_fallback(user_request, self.state.detected_topic)
 
         orchestration_prompt = f"""
@@ -1173,6 +1176,7 @@ Hoàn thành việc thu thập dữ liệu cần thiết trước khi hệ thố
         last_response = None
 
         for round_index in range(1, max_tool_rounds + 1):
+            #Ghi log
             self._workflow_event(
                 "model_turn_started",
                 round_index=round_index,
@@ -1431,7 +1435,7 @@ Chỉ trả JSON hợp lệ:
             )
 
     # =========================
-    # DISPATCHER
+    # DISPATCHER (bỏ)
     # =========================
     def _dispatch(self, action: AgentAction, final_data: Optional[dict] = None):
         if action.action == "extract_transcript":
