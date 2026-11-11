@@ -10,6 +10,7 @@ import streamlit as st
 from pymongo import MongoClient
 
 from agent import GeminiVideoAgent
+from run_report import render_measurements
 
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
@@ -326,7 +327,7 @@ if run:
     video_name = None
 
     if video_file is not None:
-        video_bytes = video_file.read()
+        video_bytes = video_file.getvalue()
         video_name = video_file.name
         video_mime = video_file.type or mimetypes.guess_type(video_name)[0] or "video/mp4"
 
@@ -335,6 +336,7 @@ if run:
         st.stop()
 
     with st.spinner("Đang chạy agent..."):
+        agent = None
         try:
             agent = GeminiVideoAgent(api_key=api_key, model=model)
 
@@ -351,8 +353,13 @@ if run:
             st.session_state.quiz_results = None
 
         except Exception as exc:
+            if agent is not None:
+                agent.evidence.abort(agent.state)
             st.exception(exc)
             st.stop()
+        finally:
+            if agent is not None:
+                agent.client.close()
 
 
 # =========================
@@ -363,6 +370,11 @@ if st.session_state.payload:
     result = payload["result"]
 
     st.success("Xử lý thành công")
+    if payload.get("schema_valid"):
+        st.caption("LearningOutput đã được kiểm tra bằng Pydantic sau khi ghép kết quả.")
+    if payload.get("request_metrics"):
+        render_measurements(payload)
+
     render_result(result)
 
     if payload.get("files"):

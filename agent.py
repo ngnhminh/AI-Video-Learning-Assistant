@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 import os
 import json
 import time
+import math
+import re
 import random
 import tempfile
 import requests
@@ -19,6 +21,7 @@ from datetime import datetime, UTC
 from pydantic import BaseModel, Field
 
 from schemas import LearningOutput
+from evidence import EvidenceRecorder
 
 load_dotenv()
 
@@ -71,7 +74,14 @@ class AgentState:
 # =========================
 class GeminiVideoAgent:
     def __init__(self, api_key: str, model: str):
-        self.client = genai.Client(api_key=api_key)
+        self.client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=120000,
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
+        )
+        self.evidence = EvidenceRecorder()
         self.model = model
 
         self.primary_model = model
@@ -92,6 +102,14 @@ class GeminiVideoAgent:
         self.inline_limit = 20 * 1024 * 1024
         self.file_limit = 2 * 1024 * 1024 * 1024
         self.max_steps = 6
+
+        # Trích transcript: mỗi lần gọi phải xong trong timeout 120 giây ở trên, nên video dài hơn
+        # segment_threshold_s được chia thành các đoạn khoảng segment_target_s giây (đoạn 12 phút mất ~82 giây).
+        self.segment_threshold_s = 600
+        self.segment_target_s = 420
+        self.min_segment_s = 90
+        self.transcript_max_tokens = 16384
+        self._uploaded_video: Optional[dict] = None
 
         self.tools: dict[str, Callable[..., Any]] = {
             "extract_transcript": self.tool_extract_transcript,
@@ -211,6 +229,8 @@ class GeminiVideoAgent:
     # RETRY
     # =========================
     def _is_retryable_error(self, exc: Exception) -> bool:
+        if getattr(exc, "code", None) in (400, 401, 402, 403):
+            return False
         msg = str(exc).upper()
         return any(
             s in msg
@@ -229,6 +249,11 @@ class GeminiVideoAgent:
     def _generate_with_retry(self, *, contents, config=None, model_name: Optional[str] = None):
         last_exc = None
         max_retries_per_model = 2
+        config = config.model_copy() if config is not None else types.GenerateContentConfig()
+        if config.temperature is None:
+            config.temperature = 0
+        if config.max_output_tokens is None:
+            config.max_output_tokens = 8192
 
         preferred = model_name or self.primary_model
         fallback_chain = list(dict.fromkeys([preferred, self.fallback_model]))
@@ -239,7 +264,8 @@ class GeminiVideoAgent:
                     self._log(
                         f"model_call model={chosen_model} attempt={attempt+1}/{max_retries_per_model}"
                     )
-                    return self.client.models.generate_content(
+                    return self.evidence.generate(
+                        self.client,
                         model=chosen_model,
                         contents=contents,
                         config=config,
@@ -560,7 +586,9 @@ Yêu cầu:
             if len(lang) <= 5:
                 return lang
             return "vi"
-        except Exception:
+        except Exception as exc:
+            if getattr(exc.__cause__, "code", None) in (401, 402, 403):
+                raise
             return "vi"
 
     def _translate_to_user_language(self, text: str) -> str:
@@ -684,47 +712,7 @@ Chỉ trả JSON hợp lệ:
             self._observe(f"Sinh truy vấn Wikipedia fallback vì lỗi: {e}")
             return list(dict.fromkeys(fallback_queries))
 
-    # =========================
-    # VIDEO
-    # =========================
-    def ingest_video(self):
-        if not self.state.video_bytes:
-            return {"error": "No video"}
-
-        size = len(self.state.video_bytes)
-
-        if size > self.file_limit:
-            return {"error": f"Video too large: {size} bytes"}
-
-        if size <= self.inline_limit:
-            return {"strategy": "inline"}
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-            tmp.write(self.state.video_bytes)
-            path = tmp.name
-
-        uploaded = self.client.files.upload(file=path)
-
-        while True:
-            f = self.client.files.get(name=uploaded.name)
-            state_name = getattr(f.state, "name", "")
-            if state_name == "ACTIVE":
-                return {"strategy": "file", "file": f}
-            if state_name == "FAILED":
-                return {"error": "File processing failed"}
-            time.sleep(3)
-
-    def tool_extract_transcript(self):
-        self._log("tool=extract_transcript")
-
-        if self.state.transcript:
-            return self.state.transcript
-
-        ingest = self.ingest_video()
-        if "error" in ingest:
-            raise RuntimeError(ingest["error"])
-
-        prompt = """
+    TRANSCRIPT_PROMPT = """
 [ROLE]
 Bạn là hệ thống trích xuất lời nói từ video bài giảng.
 
@@ -770,29 +758,282 @@ Nội dung tiếp theo...
 
 """
 
-        if ingest["strategy"] == "inline":
-            res = self._generate_with_retry(
-                contents=types.Content(
-                    role="user",
-                    parts=[
-                        types.Part(
-                            inline_data=types.Blob(
-                                data=self.state.video_bytes,
-                                mime_type=self.state.video_mime or "video/mp4",
-                            )
-                        ),
-                        types.Part(text=prompt),
-                    ],
-                ),
-                model_name=self.task_models["default"],
-            )
-        else:
-            res = self._generate_with_retry(
-                contents=[ingest["file"], prompt],
-                model_name=self.task_models["default"],
-            )
+    _TIMESTAMP_RE = re.compile(r"\[(?:(\d{1,2}):)?(\d{1,3}):(\d{2})\]")
 
-        full_text = (res.text or "").strip()
+    # =========================
+    # VIDEO
+    # =========================
+    @staticmethod
+    def _mmss(seconds: float) -> str:
+        seconds = int(round(seconds))
+        return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+    @staticmethod
+    def _mp4_duration(data: bytes) -> Optional[float]:
+        """Đọc thời lượng (giây) từ hộp moov/mvhd của tệp MP4/MOV; trả None nếu không đọc được."""
+
+        def boxes(start: int, end: int):
+            pos = start
+            while pos + 8 <= end:
+                size = int.from_bytes(data[pos:pos + 4], "big")
+                kind = data[pos + 4:pos + 8]
+                header = 8
+                if size == 1:
+                    size = int.from_bytes(data[pos + 8:pos + 16], "big")
+                    header = 16
+                elif size == 0:
+                    size = end - pos
+                if size < header:
+                    return
+                yield kind, pos + header, pos + size
+                pos += size
+
+        try:
+            for kind, body, end in boxes(0, len(data)):
+                if kind != b"moov":
+                    continue
+                for sub, sbody, _ in boxes(body, end):
+                    if sub != b"mvhd":
+                        continue
+                    if data[sbody] == 1:
+                        timescale = int.from_bytes(data[sbody + 20:sbody + 24], "big")
+                        duration = int.from_bytes(data[sbody + 24:sbody + 32], "big")
+                    else:
+                        timescale = int.from_bytes(data[sbody + 12:sbody + 16], "big")
+                        duration = int.from_bytes(data[sbody + 16:sbody + 20], "big")
+                    return duration / timescale if timescale else None
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _file_duration(f) -> Optional[float]:
+        """Thời lượng do Files API trả về, ví dụ video_metadata={'videoDuration': '1509s'}."""
+        meta = getattr(f, "video_metadata", None) or {}
+        raw = meta.get("videoDuration") or meta.get("video_duration")
+        try:
+            return float(str(raw).rstrip("s")) if raw else None
+        except ValueError:
+            return None
+
+    def ingest_video(self, force_upload: bool = False):
+        if not self.state.video_bytes:
+            return {"error": "No video"}
+
+        size = len(self.state.video_bytes)
+
+        if size > self.file_limit:
+            return {"error": f"Video too large: {size} bytes"}
+
+        if size <= self.inline_limit and not force_upload:
+            return {"strategy": "inline", "duration": self._mp4_duration(self.state.video_bytes)}
+
+        if self._uploaded_video is not None:
+            return self._uploaded_video
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp.write(self.state.video_bytes)
+            path = tmp.name
+
+        try:
+            uploaded = self.client.files.upload(file=path)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+        while True:
+            f = self.client.files.get(name=uploaded.name)
+            state_name = getattr(f.state, "name", "")
+            if state_name == "ACTIVE":
+                duration = self._file_duration(f) or self._mp4_duration(self.state.video_bytes)
+                self.state.uploaded_file_name = f.name or ""
+                self._uploaded_video = {"strategy": "file", "file": f, "duration": duration}
+                return self._uploaded_video
+            if state_name == "FAILED":
+                return {"error": "File processing failed"}
+            time.sleep(3)
+
+    def _uploaded(self, ingest: dict) -> dict:
+        """Video đã nằm trên Files API (để các đoạn dùng chung một tệp, không gửi lại dữ liệu nhiều lần)."""
+        if ingest.get("strategy") == "file":
+            return ingest
+        uploaded = self.ingest_video(force_upload=True)
+        if "error" in uploaded:
+            raise RuntimeError(uploaded["error"])
+        return uploaded
+
+    def _video_part(self, ingest: dict, segment: Optional[tuple[int, int]] = None) -> types.Part:
+        meta = None
+        if segment is not None:
+            meta = types.VideoMetadata(start_offset=f"{segment[0]}s", end_offset=f"{segment[1]}s")
+        if ingest["strategy"] == "inline":
+            return types.Part(
+                inline_data=types.Blob(
+                    data=self.state.video_bytes,
+                    mime_type=self.state.video_mime or "video/mp4",
+                ),
+                video_metadata=meta,
+            )
+        f = ingest["file"]
+        return types.Part(
+            file_data=types.FileData(file_uri=f.uri, mime_type=f.mime_type or self.state.video_mime or "video/mp4"),
+            video_metadata=meta,
+        )
+
+    def _transcript_prompt(self, segment: Optional[tuple[int, int]] = None, total: Optional[float] = None) -> str:
+        if segment is None:
+            return self.TRANSCRIPT_PROMPT
+        start, end = segment
+        return self.TRANSCRIPT_PROMPT + f"""
+[ĐOẠN VIDEO]
+Video gốc dài {self._mmss(total or end)}. Request này chỉ chứa đoạn từ [{self._mmss(start)}] đến [{self._mmss(end)}] của video gốc.
+- Chỉ chép lời nói trong đoạn này, không đoán nội dung trước hoặc sau đoạn.
+- Ghi timestamp [MM:SS] theo thời gian của video gốc (đoạn này bắt đầu tại [{self._mmss(start)}]).
+"""
+
+    def _transcribe(self, ingest: dict, segment: Optional[tuple[int, int]] = None,
+                    total: Optional[float] = None) -> tuple[str, Optional[str]]:
+        """Một lần gọi trích transcript (cả video hoặc một đoạn); trả (văn bản, finish_reason)."""
+        res = self._generate_with_retry(
+            contents=types.Content(
+                role="user",
+                parts=[self._video_part(ingest, segment), types.Part(text=self._transcript_prompt(segment, total))],
+            ),
+            # chép lời không cần suy luận: tắt thinking để mỗi lần gọi nhanh hơn và không tốn token suy nghĩ
+            config=types.GenerateContentConfig(
+                max_output_tokens=self.transcript_max_tokens,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+            model_name=self.task_models["default"],
+        )
+        finish = None
+        candidates = getattr(res, "candidates", None) or []
+        if candidates and candidates[0].finish_reason is not None:
+            fr = candidates[0].finish_reason
+            finish = getattr(fr, "name", None) or str(fr)
+        return (res.text or "").strip(), finish
+
+    @staticmethod
+    def _is_deadline_error(exc: Exception) -> bool:
+        msg = str(exc).upper()
+        return "504" in msg or "DEADLINE" in msg
+
+    def _shift_timestamps(self, text: str, start: int) -> str:
+        """Đưa mốc thời gian của một đoạn về thời gian video gốc.
+
+        Nếu model đã ghi theo video gốc thì giữ nguyên; nếu model đếm lại từ [00:00] của đoạn
+        (trung vị các mốc nhỏ hơn thời điểm bắt đầu đoạn) thì cộng thêm thời điểm bắt đầu.
+        """
+        if start <= 0:
+            return text
+
+        def secs(m: re.Match) -> int:
+            return int(m.group(1) or 0) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+
+        found = sorted(secs(m) for m in self._TIMESTAMP_RE.finditer(text))
+        if not found or found[len(found) // 2] >= start - 30:
+            return text
+        return self._TIMESTAMP_RE.sub(lambda m: f"[{self._mmss(secs(m) + start)}]", text)
+
+    def _transcribe_segments(self, ingest: dict, duration: float) -> str:
+        """Trích transcript theo từng đoạn thời gian để mỗi lần gọi xong trong thời hạn 120 giây.
+
+        Đoạn nào vẫn bị 504 hoặc chạm giới hạn token thì chia đôi và trích lại đoạn đó.
+        """
+        n = max(1, math.ceil(duration / self.segment_target_s))
+        bounds = [round(i * duration / n) for i in range(n)] + [math.ceil(duration)]
+        queue = list(zip(bounds[:-1], bounds[1:]))
+        self._observe(
+            f"Video dài {self._mmss(duration)}: trích transcript theo {n} đoạn khoảng {self._mmss(duration / n)} "
+            "để mỗi lần gọi không vượt thời hạn 120 giây."
+        )
+
+        texts: list[str] = []
+        truncated: list[str] = []
+        while queue:
+            start, end = queue.pop(0)
+            label = f"{self._mmss(start)}–{self._mmss(end)}"
+            can_split = end - start >= 2 * self.min_segment_s
+            try:
+                text, finish = self._transcribe(ingest, (start, end), duration)
+            except Exception as e:
+                if self._is_deadline_error(e) and can_split:
+                    mid = (start + end) // 2
+                    self._observe(f"Đoạn {label} quá thời hạn, chia đôi để trích lại.")
+                    queue[:0] = [(start, mid), (mid, end)]
+                    continue
+                raise
+            if finish == "MAX_TOKENS":
+                if can_split:
+                    mid = (start + end) // 2
+                    self._observe(f"Đoạn {label} chạm giới hạn token, chia đôi để trích lại.")
+                    queue[:0] = [(start, mid), (mid, end)]
+                    continue
+                truncated.append(label)
+            text = self._shift_timestamps(text, start)
+            self._workflow_event(
+                "transcript_segment",
+                start_s=start,
+                end_s=end,
+                chars=len(text),
+                finish_reason=finish,
+            )
+            if text:
+                texts.append(text)
+
+        if truncated:
+            self._observe(
+                "Cảnh báo: transcript các đoạn " + ", ".join(truncated) + " chạm giới hạn token, có thể thiếu phần cuối đoạn."
+            )
+        return "\n".join(texts)
+
+    def tool_extract_transcript(self):
+        self._log("tool=extract_transcript")
+
+        if self.state.transcript:
+            return self.state.transcript
+
+        ingest = self.ingest_video()
+        if "error" in ingest:
+            raise RuntimeError(ingest["error"])
+
+        duration = ingest.get("duration")
+        self._log(f"video_duration_s={duration} strategy={ingest['strategy']}")
+
+        if duration and duration > self.segment_threshold_s:
+            full_text = self._transcribe_segments(self._uploaded(ingest), duration)
+        else:
+            text, problem = "", None
+            try:
+                text, finish = self._transcribe(ingest)
+                if finish == "MAX_TOKENS":
+                    problem = "MAX_TOKENS"
+            except Exception as e:
+                if not self._is_deadline_error(e):
+                    raise
+                problem = e
+
+            if problem is None:
+                full_text = text
+            else:
+                ingest = self._uploaded(ingest)
+                duration = ingest.get("duration")
+                if duration:
+                    self._observe("Trích transcript trong một lần gọi không thành công (quá thời hạn hoặc chạm giới hạn "
+                                  "token), chuyển sang chia đoạn theo thời gian.")
+                    full_text = self._transcribe_segments(ingest, duration)
+                elif text:
+                    self._observe("Cảnh báo: transcript chạm giới hạn token, phần cuối video có thể bị thiếu.")
+                    full_text = text
+                else:
+                    raise RuntimeError(
+                        f"Không trích được transcript trong một lần gọi và không xác định được thời lượng video "
+                        f"để chia đoạn: {problem}"
+                    ) from (problem if isinstance(problem, Exception) else None)
+
+        full_text = (full_text or "").strip()
 
         # lưu bản full
         self.state.raw_transcript = full_text
@@ -1564,6 +1805,15 @@ Chỉ trả JSON hợp lệ:
     # =========================
     # MAIN
     # =========================
+    @staticmethod
+    def _parse_learning_output_response(response):
+        parsed = getattr(response, "parsed", None)
+        if parsed is not None:
+            data = parsed.model_dump() if hasattr(parsed, "model_dump") else parsed
+        else:
+            data = json.loads(response.text)
+        return LearningOutput.model_validate(data).model_dump()
+
     def run(self, user_request: str):
         user_request = self._normalize_user_request(user_request)
 
@@ -1574,6 +1824,8 @@ Chỉ trả JSON hợp lệ:
         self._observe(f"Ngôn ngữ người dùng: {self.state.user_language}")
 
         agent_output = self._run_agent_loop_with_gemini_tool_calling(user_request)
+        if not (self.state.transcript or "").strip():
+            raise RuntimeError("Không có transcript để tạo bài học; cần video có lời nói rõ.")
         topic_result = agent_output.get("topic_result")
         self._workflow_event("run_post_research", topic_result=topic_result, state=self._state_snapshot())
 
@@ -1604,7 +1856,7 @@ Toàn bộ output phải sử dụng ngôn ngữ có mã ISO: {self.state.user_l
 - Không được bịa nội dung không có trong transcript.
 - Phải bao quát toàn bộ nội dung video, không chỉ phần đầu transcript.
 - Nếu transcript bao gồm nhiều giai đoạn/nhiều phần nội dung, phần `tom_tat` và `y_chinh` phải phản ánh đủ các phần quan trọng trên toàn bộ video.
-- Nếu thông tin không đủ chắc chắn, hãy để trường phù hợp là null hoặc danh sách rỗng thay vì suy đoán.
+- Chỉ dùng null cho các trường tùy chọn. Các danh sách bắt buộc phải đúng giới hạn schema; không bịa thêm ý để đủ số lượng. Nếu nguồn thiếu dữ kiện, nêu rõ giới hạn trong ghi_chu_agent.
 - Nếu không có chủ đề cụ thể từ yêu cầu người dùng, `ket_qua_tim_chu_de` phải là null.
 - Nếu transcript không có timestamp chắc chắn, `moc_thoi_gian` phải là null.
 - Nếu có thông tin từ Wikipedia, chỉ dùng như phần mở rộng kiến thức nền trong `thong_tin_mo_rong` hoặc `nguon_wikipedia`.
@@ -1654,14 +1906,7 @@ Hãy dùng cả hai nguồn để bao quát toàn bộ video.
             model_name=self.task_models["final"],
         )
 
-        parsed = getattr(res, "parsed", None)
-        if parsed is not None:
-            data = parsed.model_dump()
-        else:
-            data = self._safe_json_load(res.text, {})
-
-        if not isinstance(data, dict):
-            data = {}
+        data = self._parse_learning_output_response(res)
 
         self._workflow_event("final_generation_completed", parsed=data, state=self._state_snapshot())
 
@@ -1690,6 +1935,10 @@ Hãy dùng cả hai nguồn để bao quát toàn bộ video.
         if not data.get("ghi_chu_agent"):
             data["ghi_chu_agent"] = "; ".join(self.state.logs[-8:])
 
+        # Validate again after merging tool results, before display or persistence.
+        data = LearningOutput.model_validate(data).model_dump()
+        self._workflow_event("schema_validation_passed", schema="LearningOutput", after_merge=True)
+
         db_status = None
         if self._extract_db_request(user_request):
             save_action = AgentAction(
@@ -1700,9 +1949,14 @@ Hãy dùng cả hai nguồn để bao quát toàn bộ video.
             db_status = self._dispatch(save_action, final_data=data)
             self._log(f"db_status={db_status}")
 
-        return {
+        payload = {
             "result": data,
             "logs": self.state.logs,
             "workflow_logs": self.state.workflow_logs,
             "db_status": db_status,
+            "evidence_dir": str(self.evidence.directory),
+            "request_metrics": self.evidence.calls,
+            "schema_valid": True,
         }
+        self.evidence.finish(payload, self.state.transcript, self.state.video_name, self.state.video_bytes)
+        return payload
